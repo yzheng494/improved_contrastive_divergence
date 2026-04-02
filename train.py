@@ -1,3 +1,7 @@
+import torch
+import torch.cuda
+if torch.cuda.is_available():
+    torch.cuda.init()
 import tensorflow as tf
 import numpy as np
 import timeit
@@ -654,9 +658,9 @@ def main_single(gpu, FLAGS):
     else:
         assert False
 
-    train_dataloader = DataLoader(train_dataset, num_workers=FLAGS.data_workers, batch_size=FLAGS.batch_size, shuffle=True, drop_last=True)
-    valid_dataloader = DataLoader(valid_dataset, num_workers=FLAGS.data_workers, batch_size=FLAGS.batch_size, shuffle=True, drop_last=True)
-    test_dataloader = DataLoader(test_dataset, num_workers=FLAGS.data_workers, batch_size=FLAGS.batch_size, shuffle=True, drop_last=True)
+    train_dataloader = DataLoader(train_dataset, num_workers=FLAGS.data_workers, batch_size=FLAGS.batch_size, shuffle=True, drop_last=True, multiprocessing_context='spawn' if FLAGS.data_workers > 0 else None)
+    valid_dataloader = DataLoader(valid_dataset, num_workers=FLAGS.data_workers, batch_size=FLAGS.batch_size, shuffle=True, drop_last=True, multiprocessing_context='spawn' if FLAGS.data_workers > 0 else None)
+    test_dataloader = DataLoader(test_dataset, num_workers=FLAGS.data_workers, batch_size=FLAGS.batch_size, shuffle=True, drop_last=True, multiprocessing_context='spawn' if FLAGS.data_workers > 0 else None)
 
     FLAGS_OLD = FLAGS
 
@@ -712,7 +716,7 @@ def main_single(gpu, FLAGS):
     torch.cuda.set_device(gpu)
     if FLAGS.cuda:
         models = [model.cuda(gpu) for model in models]
-        model_ema = [model_ema.cuda(gpu) for model_ema in models_ema]
+        models_ema = [model_ema.cuda(gpu) for model_ema in models_ema]
 
     if FLAGS.gpus > 1:
         sync_model(models)

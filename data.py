@@ -66,26 +66,31 @@ def cutout(mask_color=(0, 0, 0)):
 class CelebAHQ(Dataset):
 
     def __init__(self, cond_idx=1, filter_idx=0):
-        self.path = "/datasets01/celebAHQ/081318/imgHQ{:05}.npy"
-        self.labels = pd.read_csv("/private/home/yilundu/list_attr_celeba.txt", sep="\s+", skiprows=1)
-        self.hq_labels = pd.read_csv("/private/home/yilundu/image_list.txt", sep="\s+")
+        self.path = "data/celeba/img_align_celeba/"
+        self.labels = pd.read_csv("data/celeba/list_attr_celeba.txt", sep="\s+", skiprows=1)
         self.cond_idx = cond_idx
         self.filter_idx = filter_idx
 
+        if filter_idx != 0:
+            mask = (self.labels.to_numpy()[:, self.cond_idx] == filter_idx)
+            self.labels = self.labels[mask].reset_index()
+
     def __len__(self):
-        return self.hq_labels.shape[0]
+        return self.labels.shape[0]
 
     def __getitem__(self, index):
-        info = self.hq_labels.iloc[index]
-        info = self.labels.iloc[info.orig_idx]
 
-        path = self.path.format(index)
-        im = np.load(path)
-        im = im[0].transpose((1, 2, 0))
+
+        info = self.labels.iloc[index]
+        if self.filter_idx != 0:
+            fname = info['index']
+        else:
+            fname = info.name
+        path = osp.join(self.path, fname)
+        im = imread(path)
+        im = imresize(im, (128, 128))
         image_size = 128
-        im = imresize(im, (image_size, image_size))
-        im = im / 256
-        im = im + np.random.uniform(0, 1 / 256., im.shape)
+        im = im / 255.
 
         label = int(info.iloc[self.cond_idx])
         if label == -1:
@@ -182,9 +187,6 @@ class CelebA(Dataset):
 
     def __getitem__(self, index):
 
-
-        if FLAGS.single:
-            index = 0
 
         info = self.labels.iloc[index]
         if self.filter_idx != 0:
