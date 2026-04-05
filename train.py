@@ -196,6 +196,7 @@ def hamiltonian(x, v, model, label):
 def leapfrog_step(x, v, model, step_size, num_steps, label, sample=False):
     x.requires_grad_(requires_grad=True)
     energy = model.forward(x, label)
+    energy = torch.clamp(energy, -1e6, 1e6)
     im_grad = torch.autograd.grad([energy.sum()], [x])[0]
     v = v - 0.5 * step_size * im_grad
     im_negs = []
@@ -203,6 +204,7 @@ def leapfrog_step(x, v, model, step_size, num_steps, label, sample=False):
     for i in range(num_steps):
         x.requires_grad_(requires_grad=True)
         energy = model.forward(x, label)
+        energy = torch.clamp(energy, -1e6, 1e6)
 
         if i == num_steps - 1:
             im_grad = torch.autograd.grad([energy.sum()], [x], create_graph=True)[0]
@@ -257,6 +259,7 @@ def gen_image(label, FLAGS, model, im_neg, num_steps, sample=False):
 
         im_neg.requires_grad_(requires_grad=True)
         energy = model.forward(im_neg, label)
+        energy = torch.clamp(energy, -1e6, 1e6)
 
         if FLAGS.all_step:
             im_grad = torch.autograd.grad([energy.sum()], [im_neg], create_graph=True)[0]
@@ -290,6 +293,7 @@ def gen_image(label, FLAGS, model, im_neg, num_steps, sample=False):
                 pass
             else:
                 energy = model.forward(im_neg_kl, label)
+                energy = torch.clamp(energy, -1e6, 1e6)
                 im_grad = torch.autograd.grad([energy.sum()], [im_neg_kl], create_graph=True)[0]
 
             im_neg_kl = im_neg_kl - FLAGS.step_lr * im_grad[:n]
