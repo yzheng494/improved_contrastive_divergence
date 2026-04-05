@@ -498,16 +498,100 @@ def _run_trajectory(model_list, labels, x0, n, im_size):
     return trajectory
 
 
-def _compute_energy_score(model_list, labels, im_gpu):
-    """Return mean negative energy (higher = sample fits the model better).
+_inception_model = None
+_inception_logits_model = None
 
-    Used as a proxy for accuracy when no external classifier is available.
-    The EBM assigns low energy to samples it considers high quality, so
-    -energy is a natural quality score.
-    """
+
+def _get_inception_features_model():
+    """Inception v3 with the final pool layer as output (2048-d), for FID/precision."""
+    global _inception_model
+    if _inception_model is None:
+        from torchvision.models import inception_v3
+        m = inception_v3(pretrained=True, transform_input=False)
+        m.fc = nn.Identity()
+        _inception_model = m.cuda().eval()
+    return _inception_model
+
+
+def _extract_features(images_cuda, batch_size=16):
+    """Extract 2048-d Inception pool features. images_cuda: (N,3,H,W) in [0,1]."""
+    import torch.nn.functional as F
+    from torchvision import transforms as T
+    model = _get_inception_features_model()
+    resize = T.Resize((299, 299), antialias=True)
+    feats = []
     with torch.no_grad():
-        energy = sum(m.forward(im_gpu, l) for m, l in zip(model_list, labels))
-    return (-energy.mean()).item()
+        for i in range(0, images_cuda.shape[0], batch_size):
+            x = resize(images_cuda[i:i+batch_size])
+            out = model(x)
+            if hasattr(out, 'logits'):
+                out = out.logits
+            feats.append(out.cpu())
+    return torch.cat(feats, dim=0).numpy()  # (N, 2048)
+
+
+def _compute_fid(feats_real, feats_fake):
+    """Fréchet Inception Distance between two sets of features."""
+    from scipy import linalg
+    mu_r, sigma_r = feats_real.mean(0), np.cov(feats_real, rowvar=False)
+    mu_f, sigma_f = feats_fake.mean(0), np.cov(feats_fake, rowvar=False)
+    diff = mu_r - mu_f
+    covmean, _ = linalg.sqrtm(sigma_r @ sigma_f, disp=False)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    return float(diff @ diff + np.trace(sigma_r + sigma_f - 2 * covmean))
+
+
+def _compute_precision(feats_real, feats_fake, k=3):
+    """Precision: fraction of fake samples within the real manifold (k-NN)."""
+    from sklearn.neighbors import NearestNeighbors
+    nbrs = NearestNeighbors(n_neighbors=k+1).fit(feats_real)
+    # radius = k-th NN distance for each real sample
+    dists_real, _ = nbrs.kneighbors(feats_real)
+    radii = dists_real[:, -1]  # (N_real,)
+    # For each fake, check if it's within any real sample's radius
+    dists_fake, _ = nbrs.kneighbors(feats_fake)
+    # dists_fake[:, 0] = distance to nearest real sample
+    nearest_real_dist = dists_fake[:, 0]
+    nearest_real_idx = nbrs.kneighbors(feats_fake, n_neighbors=1, return_distance=False)[:, 0]
+    precision = float((nearest_real_dist <= radii[nearest_real_idx]).mean())
+    return precision
+
+
+def _get_inception():
+    global _inception_model
+    if _inception_model is None:
+        from torchvision.models import inception_v3
+        m = inception_v3(pretrained=True, transform_input=False)
+        m.fc = nn.Identity()   # extract 2048-d pool features, not logits
+        m = m.cuda().eval()
+        _inception_model = m
+    return _inception_model
+
+
+def _compute_inception_score(im_gpu):
+    """Inception Score proxy: mean entropy of softmax predictions.
+
+    Uses torchvision's pretrained Inception v3. Images are resized to 299×299
+    as required by Inception. Returns mean KL(p(y|x) || p(y)), i.e. the IS
+    contribution per sample — higher means more confident and diverse predictions.
+    """
+    import torch.nn.functional as F
+    from torchvision import transforms as T
+    from torchvision.models import inception_v3
+
+    # Build a temporary Inception with logits output for IS
+    model = inception_v3(pretrained=True, transform_input=False).cuda().eval()
+    resize = T.Resize((299, 299), antialias=True)
+    with torch.no_grad():
+        x = resize(im_gpu)
+        logits = model(x)
+        if hasattr(logits, 'logits'):  # InceptionOutputs namedtuple
+            logits = logits.logits
+        p_yx = F.softmax(logits, dim=1)            # (n, 1000)
+        p_y = p_yx.mean(dim=0, keepdim=True)       # (1, 1000) marginal
+        kl = (p_yx * (p_yx.clamp(min=1e-8).log() - p_y.clamp(min=1e-8).log())).sum(dim=1)
+    return kl.mean().item()
 
 
 def quantization_figure(model_list_orig, select_idx):
@@ -531,11 +615,44 @@ def quantization_figure(model_list_orig, select_idx):
     import matplotlib.pyplot as plt
 
     quant_types = ['fp4', 'fp8', 'int8', 'nf4']
-    n = 16
+    n = 64       # larger batch gives more reliable FID/precision estimates
     im_size = 128
+    fid_interval = 5  # compute FID/precision every this many steps
 
-    # Classifier is optional; energy score is used as fallback accuracy proxy
-    thresholds = [0.5, 0.1, 0.5, 0.5]  # (old, male, smiling, wavy_hair) — unused without classifier
+    # --- Real image features for FID and precision ---
+    # Filter real images to match the SAME attributes as select_idx so the
+    # reference distribution is comparable to the generated distribution.
+    # Model order: [old, male, smiling, wavy_hair] → CelebA column indices (0-based):
+    #   old      = Young == -1  → col 39
+    #   male     = Male         → col 20
+    #   smiling  = Smiling      → col 31
+    #   wavy_hair= Wavy_Hair    → col 33
+    # select_idx value 1 → attribute present (+1 in CelebA)
+    # select_idx value 0 → attribute absent  (-1 in CelebA)
+    import pandas as pd
+    from torchvision import transforms as T
+    attr_cols   = [39, 20, 31, 33]          # col indices matching model order
+    attr_signs  = [(-1, 1), (1, -1), (1, -1), (-1, 1)]  # (value when select=1, value when select=0)
+    print("=== Filtering real images by attributes and extracting features for FID/precision ===")
+    celeba_dir  = "data/celeba/img_align_celeba"
+    attr_df = pd.read_csv("data/celeba/list_attr_celeba.txt", sep=r"\s+", skiprows=1)
+    mask = np.ones(len(attr_df), dtype=bool)
+    for col_idx, (val1, val0), six in zip(attr_cols, attr_signs, select_idx):
+        col_name = attr_df.columns[col_idx]
+        expected = val1 if six == 1 else val0
+        mask &= (attr_df[col_name].values == expected)
+    filtered_files = attr_df.index[mask].tolist()
+    print(f"Found {len(filtered_files)} real images matching attributes")
+    np.random.seed(0)
+    chosen = np.random.choice(filtered_files, size=min(2000, len(filtered_files)), replace=False)
+    to_tensor = T.Compose([T.Resize((128, 128)), T.ToTensor()])
+    real_imgs = []
+    for fname in chosen:
+        img = Image.open(osp.join(celeba_dir, fname)).convert('RGB')
+        real_imgs.append(to_tensor(img))
+    real_imgs = torch.stack(real_imgs).cuda()
+    feats_real = _extract_features(real_imgs)
+    print(f"Real features extracted: {feats_real.shape} ({len(chosen)} attribute-matched images)\n")
 
     # --- Labels ---
     labels = []
@@ -580,14 +697,23 @@ def quantization_figure(model_list_orig, select_idx):
     model_list_default = [copy.deepcopy(m) for m in model_list_orig]
     default_traj = _run_trajectory(model_list_default, labels, x0, n, im_size)
 
-    default_acc = [
-        _compute_energy_score(model_list_default, labels, t.cuda())
-        for t in default_traj
-    ]
-    print(f"Default done. Final energy score: {default_acc[-1]:.4f}\n")
+    default_acc = []
+    default_fid = []
+    default_precision = []
+    for step, t in enumerate(default_traj):
+        t_gpu = t.cuda()
+        default_acc.append(_compute_inception_score(t_gpu))
+        if step % fid_interval == 0 or step == len(default_traj) - 1:
+            feats = _extract_features(t_gpu)
+            default_fid.append(_compute_fid(feats_real, feats))
+            default_precision.append(_compute_precision(feats_real, feats))
+        else:
+            default_fid.append(None)
+            default_precision.append(None)
+    print(f"Default done. Final IS: {default_acc[-1]:.4f} | FID: {default_fid[-1]:.2f} | Precision: {default_precision[-1]:.4f}\n")
 
     # --- Step 3: Each quantized trajectory ---
-    all_results = {}   # quant_type -> {'l2_div': [...], 'accuracy': [...]}
+    all_results = {}   # quant_type -> {'l2_div': [...], 'accuracy': [...], 'fid': [...], 'precision': [...]}
     final_frames = {}  # quant_type -> last CPU tensor (for image saving)
 
     for qt in quant_types:
@@ -595,39 +721,51 @@ def quantization_figure(model_list_orig, select_idx):
         model_list_q = [quantize_model(copy.deepcopy(m), qt) for m in model_list_orig]
         traj = _run_trajectory(model_list_q, labels, x0, n, im_size)
 
-        l2_divs = []
-        accs = []
-        for t_q, t_d in zip(traj, default_traj):
-            l2 = ((t_q - t_d).norm(p=2) / (t_d.norm(p=2) + 1e-8)).item()
-            l2_divs.append(l2)
-            accs.append(_compute_energy_score(model_list_q, labels, t_q.cuda()))
+        l2_divs, accs, fids, precisions = [], [], [], []
+        for step, (t_q, t_d) in enumerate(zip(traj, default_traj)):
+            t_gpu = t_q.cuda()
+            l2_divs.append(((t_q - t_d).norm(p=2) / (t_d.norm(p=2) + 1e-8)).item())
+            accs.append(_compute_inception_score(t_gpu))
+            if step % fid_interval == 0 or step == len(traj) - 1:
+                feats = _extract_features(t_gpu)
+                fids.append(_compute_fid(feats_real, feats))
+                precisions.append(_compute_precision(feats_real, feats))
+            else:
+                fids.append(None)
+                precisions.append(None)
 
-        all_results[qt] = {'l2_div': l2_divs, 'accuracy': accs}
+        all_results[qt] = {'l2_div': l2_divs, 'accuracy': accs, 'fid': fids, 'precision': precisions}
         final_frames[qt] = traj[-1]
-        print(f"{qt} done. Final L2 div: {l2_divs[-1]:.4f}, Final energy score: {accs[-1]:.4f}\n")
+        print(f"{qt} done. Final L2: {l2_divs[-1]:.4f} | IS: {accs[-1]:.4f} | FID: {fids[-1]:.2f} | Precision: {precisions[-1]:.4f}\n")
 
     # --- Summary table ---
-    print(f"{'Experiment':<10} | {'Avg L2 div':>10} | {'Final L2':>8} | {'Avg score':>9} | {'Final score':>11}")
-    print("-" * 60)
-    print(f"{'default':<10} | {'N/A':>10} | {'N/A':>8} | {np.mean(default_acc):>9.4f} | {default_acc[-1]:>11.4f}")
+    final_fid_def = next(v for v in reversed(default_fid) if v is not None)
+    final_prec_def = next(v for v in reversed(default_precision) if v is not None)
+    print(f"\n{'Experiment':<10} | {'Avg L2 div':>10} | {'Final L2':>8} | {'Avg IS':>7} | {'Final FID':>9} | {'Final Prec':>10}")
+    print("-" * 68)
+    print(f"{'default':<10} | {'N/A':>10} | {'N/A':>8} | {np.mean(default_acc):>7.4f} | {final_fid_def:>9.2f} | {final_prec_def:>10.4f}")
     for qt in quant_types:
         r = all_results[qt]
+        final_fid = next(v for v in reversed(r['fid']) if v is not None)
+        final_prec = next(v for v in reversed(r['precision']) if v is not None)
         print(f"{qt:<10} | {np.mean(r['l2_div']):>10.4f} | {r['l2_div'][-1]:>8.4f} "
-              f"| {np.mean(r['accuracy']):>9.4f} | {r['accuracy'][-1]:>11.4f}")
+              f"| {np.mean(r['accuracy']):>7.4f} | {final_fid:>9.2f} | {final_prec:>10.4f}")
 
-    # Save raw results
-    save_data = {'default_acc': default_acc, **all_results}
-    np.save('quant_results.npy', save_data)
-    print("\nSaved per-step metrics to quant_results.npy")
+    save_data = {
+        'default_acc': default_acc, 'default_fid': default_fid, 'default_precision': default_precision,
+        **all_results
+    }
 
-    # --- Step 4: Plots ---
+    # --- Step 4: Plots (only non-None FID/precision steps) ---
     steps = list(range(FLAGS.num_steps))
+    fid_steps = [s for s in steps if s % fid_interval == 0 or s == FLAGS.num_steps - 1]
     colors = {'fp4': 'tab:blue', 'fp8': 'tab:orange', 'int8': 'tab:green', 'nf4': 'tab:red'}
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
 
-    # Plot 1: L2 divergence
+    # Plot 1: L2 divergence (every step)
     ax = axes[0]
+    ax.axhline(0, color='black', linewidth=2.5, linestyle='--', label='default', zorder=10)
     for qt in quant_types:
         ax.plot(steps, all_results[qt]['l2_div'], label=qt, color=colors[qt])
     ax.set_xlabel('MCMC step')
@@ -636,31 +774,60 @@ def quantization_figure(model_list_orig, select_idx):
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Plot 2: Accuracy
+    # Plot 2: Inception score (every step)
     ax = axes[1]
-    ax.plot(steps, default_acc, label='default', color='black', linewidth=2)
     for qt in quant_types:
-        ax.plot(steps, all_results[qt]['accuracy'], label=qt, color=colors[qt])
+        ax.plot(steps, all_results[qt]['accuracy'], label=qt, color=colors[qt], alpha=0.8)
+    ax.plot(steps, default_acc, label='default', color='black', linewidth=2.5, linestyle='--', zorder=10)
     ax.set_xlabel('MCMC step')
-    ax.set_ylabel('Energy score (-energy)')
-    ax.set_title('Energy score over MCMC steps (higher = better)')
+    ax.set_ylabel('Inception score (IS)')
+    ax.set_title('Inception score over MCMC steps (higher = more realistic & diverse)')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    plt.tight_layout()
-    plt.savefig('quant_comparison.png', dpi=150)
-    print("Saved comparison plot to quant_comparison.png")
+    # Plot 3: FID (every fid_interval steps)
+    ax = axes[2]
+    for qt in quant_types:
+        ax.plot(fid_steps, [all_results[qt]['fid'][s] for s in fid_steps], label=qt, color=colors[qt], alpha=0.8)
+    ax.plot(fid_steps, [default_fid[s] for s in fid_steps], label='default', color='black', linewidth=2.5, linestyle='--', zorder=10)
+    ax.set_xlabel('MCMC step')
+    ax.set_ylabel('FID (lower = better)')
+    ax.set_title(f'FID vs real CelebA (every {fid_interval} steps)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
-    # Save final images (4×4 grid) for default and each quant type
+    # Plot 4: Precision (every fid_interval steps)
+    ax = axes[3]
+    for qt in quant_types:
+        ax.plot(fid_steps, [all_results[qt]['precision'][s] for s in fid_steps], label=qt, color=colors[qt], alpha=0.8)
+    ax.plot(fid_steps, [default_precision[s] for s in fid_steps], label='default', color='black', linewidth=2.5, linestyle='--', zorder=10)
+    ax.set_xlabel('MCMC step')
+    ax.set_ylabel('Precision (higher = better)')
+    ax.set_title(f'Precision vs real CelebA (every {fid_interval} steps)')
+    ax.set_ylim(0, 1)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    out_dir = "quant_results"
+    os.makedirs(out_dir, exist_ok=True)
+
+    plt.tight_layout()
+    plt.savefig(osp.join(out_dir, 'quant_comparison.png'), dpi=150)
+    print(f"Saved comparison plot to {out_dir}/quant_comparison.png")
+
+    # Save final images (8×8 grid) for default and each quant type
     def save_grid(frame_cpu, name):
         out = frame_cpu.numpy().transpose(0, 2, 3, 1)
-        out = out.reshape(4, 4, im_size, im_size, 3).transpose(0, 2, 1, 3, 4).reshape(4 * im_size, 4 * im_size, 3)
-        imsave(f"quant_{name}.png", (out * 255).astype(np.uint8))
+        out = out.reshape(8, 8, im_size, im_size, 3).transpose(0, 2, 1, 3, 4).reshape(8 * im_size, 8 * im_size, 3)
+        imsave(osp.join(out_dir, f"quant_{name}.png"), (out * 255).astype(np.uint8))
 
     save_grid(default_traj[-1], 'default')
     for qt in quant_types:
         save_grid(final_frames[qt], qt)
-        print(f"Saved quant_{qt}.png")
+        print(f"Saved {out_dir}/quant_{qt}.png")
+
+    np.save(osp.join(out_dir, 'quant_results.npy'), save_data)
+    print(f"Saved per-step metrics to {out_dir}/quant_results.npy")
 
     return save_data
 
