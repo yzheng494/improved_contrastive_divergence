@@ -40,6 +40,11 @@ flags.DEFINE_bool('eval', False, 'Whether to quantitively evaluate models')
 flags.DEFINE_bool('latent_energy', False, 'latent energy in model')
 flags.DEFINE_bool('proj_latent', False, 'Projection of latents')
 
+flags.DEFINE_integer('num_samples', 64, 'Number of images generated per MCMC step (higher = more reliable FID/precision; 512 recommended)')
+flags.DEFINE_integer('fid_pca_dim', 0, 'PCA dimension before FID/precision (0 = no PCA; 256 recommended when num_samples >= 512)')
+flags.DEFINE_string('out_dir', 'quant_results', 'Directory to save output images, plots, and metrics')
+flags.DEFINE_bool('cross_step', False, 'Whether to also run cross-step inference (use g[t-2] instead of g[t-1])')
+
 
 # Whether to train for gentest
 flags.DEFINE_bool('train', False, 'whether to train on generalization into multiple different predictions')
@@ -491,10 +496,68 @@ def _run_trajectory(model_list, labels, x0, n, im_size):
         noise = torch.empty(n, 3, im_size, im_size, device='cuda').normal_(generator=g)
         im = im + 0.001 * noise
         im.requires_grad_(True)
-        energy = sum(m.forward(im, l) for m, l in zip(model_list, labels))
-        im_grad = torch.autograd.grad([energy.sum()], [im])[0]
+        im_grad = None
+        for m, l in zip(model_list, labels):
+            g = torch.autograd.grad([m.forward(im, l).sum()], [im])[0]
+            im_grad = g if im_grad is None else im_grad + g
         im = (im - FLAGS.step_lr * im_grad).detach().clamp(0, 1)
         trajectory.append(im.cpu())
+    return trajectory
+
+
+def _run_trajectory_cross_step(model_list_orig, labels, x0, n, im_size, quant_type=None):
+    """Run MCMC with cross-step gradient: use g[t-2] to update sample before fwd/bwd.
+
+    Steps 0 and 1 run normally (no two-step-earlier gradient available).
+    From step 2 onward:
+        im = im + noise - step_lr * g[t-2]   (apply stale gradient before fwd)
+        g[t] = compute_grad(im)               (compute current gradient for future use)
+
+    Args:
+        model_list_orig: list of models (will be deep-copied if quant_type is set)
+        quant_type: optional quantization type ('fp4', 'fp8', 'int8', 'nf4').
+                    If given, models are deep-copied and quantized internally.
+    Returns:
+        List of CPU tensors (one per step).
+    """
+    if quant_type is not None:
+        model_list = [quantize_model(copy.deepcopy(m), quant_type) for m in model_list_orig]
+    else:
+        model_list = model_list_orig
+
+    trajectory = []
+    im = x0.clone()
+    grad_prev2 = None  # g[t-2]
+    grad_prev1 = None  # g[t-1]
+
+    for step in range(FLAGS.num_steps):
+        g_gen = torch.Generator(device='cuda')
+        g_gen.manual_seed(1000 + step)
+        noise = torch.empty(n, 3, im_size, im_size, device='cuda').normal_(generator=g_gen)
+        im = im + 0.001 * noise
+
+        if step >= 2:
+            # Cross-step: apply gradient from two steps ago before the forward pass
+            im = (im - FLAGS.step_lr * grad_prev2).clamp(0, 1)
+
+        im.requires_grad_(True)
+        im_grad = None
+        for m, l in zip(model_list, labels):
+            g = torch.autograd.grad([m.forward(im, l).sum()], [im])[0]
+            im_grad = g if im_grad is None else im_grad + g
+
+        if step < 2:
+            # Normal update for initial two steps (no stale gradient yet)
+            im = (im - FLAGS.step_lr * im_grad).detach().clamp(0, 1)
+        else:
+            im = im.detach().clamp(0, 1)
+
+        # Advance gradient history ring buffer
+        grad_prev2 = grad_prev1
+        grad_prev1 = im_grad.detach()
+
+        trajectory.append(im.cpu())
+
     return trajectory
 
 
@@ -510,6 +573,8 @@ def _get_inception_features_model():
         m = inception_v3(pretrained=True, transform_input=False)
         m.fc = nn.Identity()
         _inception_model = m.cuda().eval()
+    else:
+        _inception_model.cuda()
     return _inception_model
 
 
@@ -530,11 +595,25 @@ def _extract_features(images_cuda, batch_size=16):
     return torch.cat(feats, dim=0).numpy()  # (N, 2048)
 
 
+def _maybe_pca(feats_real, feats_fake):
+    """Optionally PCA-project features. Controlled by --fid_pca_dim flag."""
+    pca_dim = FLAGS.fid_pca_dim
+    if pca_dim <= 0:
+        return feats_real, feats_fake
+    from sklearn.decomposition import PCA
+    n_components = min(pca_dim, feats_real.shape[0] - 1, feats_fake.shape[0] - 1, feats_real.shape[1])
+    n_components = max(n_components, 1)
+    pca = PCA(n_components=n_components)
+    pca.fit(np.concatenate([feats_real, feats_fake], axis=0))
+    return pca.transform(feats_real), pca.transform(feats_fake)
+
+
 def _compute_fid(feats_real, feats_fake):
     """Fréchet Inception Distance between two sets of features."""
     from scipy import linalg
-    mu_r, sigma_r = feats_real.mean(0), np.cov(feats_real, rowvar=False)
-    mu_f, sigma_f = feats_fake.mean(0), np.cov(feats_fake, rowvar=False)
+    r, f = _maybe_pca(feats_real, feats_fake)
+    mu_r, sigma_r = r.mean(0), np.cov(r, rowvar=False)
+    mu_f, sigma_f = f.mean(0), np.cov(f, rowvar=False)
     diff = mu_r - mu_f
     covmean, _ = linalg.sqrtm(sigma_r @ sigma_f, disp=False)
     if np.iscomplexobj(covmean):
@@ -545,15 +624,12 @@ def _compute_fid(feats_real, feats_fake):
 def _compute_precision(feats_real, feats_fake, k=3):
     """Precision: fraction of fake samples within the real manifold (k-NN)."""
     from sklearn.neighbors import NearestNeighbors
-    nbrs = NearestNeighbors(n_neighbors=k+1).fit(feats_real)
-    # radius = k-th NN distance for each real sample
-    dists_real, _ = nbrs.kneighbors(feats_real)
-    radii = dists_real[:, -1]  # (N_real,)
-    # For each fake, check if it's within any real sample's radius
-    dists_fake, _ = nbrs.kneighbors(feats_fake)
-    # dists_fake[:, 0] = distance to nearest real sample
-    nearest_real_dist = dists_fake[:, 0]
-    nearest_real_idx = nbrs.kneighbors(feats_fake, n_neighbors=1, return_distance=False)[:, 0]
+    r, f = _maybe_pca(feats_real, feats_fake)
+    nbrs = NearestNeighbors(n_neighbors=k+1).fit(r)
+    dists_real, _ = nbrs.kneighbors(r)
+    radii = dists_real[:, -1]
+    nearest_real_dist = nbrs.kneighbors(f, n_neighbors=1, return_distance=True)[0][:, 0]
+    nearest_real_idx  = nbrs.kneighbors(f, n_neighbors=1, return_distance=False)[:, 0]
     precision = float((nearest_real_dist <= radii[nearest_real_idx]).mean())
     return precision
 
@@ -566,6 +642,8 @@ def _get_inception():
         m.fc = nn.Identity()   # extract 2048-d pool features, not logits
         m = m.cuda().eval()
         _inception_model = m
+    else:
+        _inception_model.cuda()
     return _inception_model
 
 
@@ -594,7 +672,7 @@ def _compute_inception_score(im_gpu):
     return kl.mean().item()
 
 
-def quantization_figure(model_list_orig, select_idx):
+def quantization_figure(model_list_orig, select_idx, run_cross_step=False):
     """Run default + 4 quantized trajectories from the same x0 and plot comparisons.
 
     Flow:
@@ -615,7 +693,7 @@ def quantization_figure(model_list_orig, select_idx):
     import matplotlib.pyplot as plt
 
     quant_types = ['fp4', 'fp8', 'int8', 'nf4']
-    n = 64       # larger batch gives more reliable FID/precision estimates
+    n = FLAGS.num_samples  # set via --num_samples (64=fast/noisy, 512=recommended, 1024=reliable)
     im_size = 128
     fid_interval = 5  # compute FID/precision every this many steps
 
@@ -653,6 +731,8 @@ def quantization_figure(model_list_orig, select_idx):
     real_imgs = torch.stack(real_imgs).cuda()
     feats_real = _extract_features(real_imgs)
     print(f"Real features extracted: {feats_real.shape} ({len(chosen)} attribute-matched images)\n")
+    del real_imgs
+    torch.cuda.empty_cache()
 
     # --- Labels ---
     labels = []
@@ -672,6 +752,11 @@ def quantization_figure(model_list_orig, select_idx):
         transforms.ToTensor(),
     ])
 
+    # Move Inception off GPU during MCMC phases to free ~90 MB
+    if _inception_model is not None:
+        _inception_model.cpu()
+        torch.cuda.empty_cache()
+
     # --- Step 1: Shared x0 via warm-up with default models ---
     print("=== Warm-up (default models) → x0 ===")
     torch.manual_seed(42)
@@ -683,8 +768,10 @@ def quantization_figure(model_list_orig, select_idx):
             im_noise.normal_()
             im = im + 0.001 * im_noise
             im.requires_grad_(True)
-            energy = sum(m.forward(im, l) for m, l in zip(model_list_orig, labels))
-            im_grad = torch.autograd.grad([energy.sum()], [im])[0]
+            im_grad = None
+            for m, l in zip(model_list_orig, labels):
+                g = torch.autograd.grad([m.forward(im, l).sum()], [im])[0]
+                im_grad = g if im_grad is None else im_grad + g
             im = (im - FLAGS.step_lr * im_grad).detach().clamp(0, 1)
         im_np = (im.detach().cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
         ims_aug = [np.array(transform(Image.fromarray(im_np[i]))) for i in range(n)]
@@ -696,6 +783,8 @@ def quantization_figure(model_list_orig, select_idx):
     print("=== Running: default ===")
     model_list_default = [copy.deepcopy(m) for m in model_list_orig]
     default_traj = _run_trajectory(model_list_default, labels, x0, n, im_size)
+    del model_list_default
+    torch.cuda.empty_cache()
 
     default_acc = []
     default_fid = []
@@ -713,13 +802,18 @@ def quantization_figure(model_list_orig, select_idx):
     print(f"Default done. Final IS: {default_acc[-1]:.4f} | FID: {default_fid[-1]:.2f} | Precision: {default_precision[-1]:.4f}\n")
 
     # --- Step 3: Each quantized trajectory ---
-    all_results = {}   # quant_type -> {'l2_div': [...], 'accuracy': [...], 'fid': [...], 'precision': [...]}
-    final_frames = {}  # quant_type -> last CPU tensor (for image saving)
+    all_results = {}   # key -> {'l2_div': [...], 'accuracy': [...], 'fid': [...], 'precision': [...]}
+    final_frames = {}  # key -> last CPU tensor (for image saving)
 
     for qt in quant_types:
         print(f"=== Running: {qt} ===")
+        if _inception_model is not None:
+            _inception_model.cpu()
+            torch.cuda.empty_cache()
         model_list_q = [quantize_model(copy.deepcopy(m), qt) for m in model_list_orig]
         traj = _run_trajectory(model_list_q, labels, x0, n, im_size)
+        del model_list_q
+        torch.cuda.empty_cache()
 
         l2_divs, accs, fids, precisions = [], [], [], []
         for step, (t_q, t_d) in enumerate(zip(traj, default_traj)):
@@ -738,17 +832,76 @@ def quantization_figure(model_list_orig, select_idx):
         final_frames[qt] = traj[-1]
         print(f"{qt} done. Final L2: {l2_divs[-1]:.4f} | IS: {accs[-1]:.4f} | FID: {fids[-1]:.2f} | Precision: {precisions[-1]:.4f}\n")
 
+    # --- Step 3b (optional): Cross-step trajectories ---
+    cross_step_keys = []  # tracks which cross-step keys were added
+    if run_cross_step:
+        # Default model, cross-step
+        print("=== Running: cross_step (default) ===")
+        if _inception_model is not None:
+            _inception_model.cpu()
+            torch.cuda.empty_cache()
+        cs_traj = _run_trajectory_cross_step(model_list_orig, labels, x0, n, im_size)
+        torch.cuda.empty_cache()
+
+        l2_divs, accs, fids, precisions = [], [], [], []
+        for step, (t_cs, t_d) in enumerate(zip(cs_traj, default_traj)):
+            t_gpu = t_cs.cuda()
+            l2_divs.append(((t_cs - t_d).norm(p=2) / (t_d.norm(p=2) + 1e-8)).item())
+            accs.append(_compute_inception_score(t_gpu))
+            if step % fid_interval == 0 or step == len(cs_traj) - 1:
+                feats = _extract_features(t_gpu)
+                fids.append(_compute_fid(feats_real, feats))
+                precisions.append(_compute_precision(feats_real, feats))
+            else:
+                fids.append(None)
+                precisions.append(None)
+
+        all_results['cross_step'] = {'l2_div': l2_divs, 'accuracy': accs, 'fid': fids, 'precision': precisions}
+        final_frames['cross_step'] = cs_traj[-1]
+        cross_step_keys.append('cross_step')
+        print(f"cross_step done. Final L2: {l2_divs[-1]:.4f} | IS: {accs[-1]:.4f} | FID: {fids[-1]:.2f} | Precision: {precisions[-1]:.4f}\n")
+
+        # Cross-step with each quantization type
+        for qt in quant_types:
+            key = f'cross_step_{qt}'
+            print(f"=== Running: {key} ===")
+            if _inception_model is not None:
+                _inception_model.cpu()
+                torch.cuda.empty_cache()
+            cs_traj_q = _run_trajectory_cross_step(model_list_orig, labels, x0, n, im_size, quant_type=qt)
+            torch.cuda.empty_cache()
+
+            l2_divs, accs, fids, precisions = [], [], [], []
+            for step, (t_cs, t_d) in enumerate(zip(cs_traj_q, default_traj)):
+                t_gpu = t_cs.cuda()
+                l2_divs.append(((t_cs - t_d).norm(p=2) / (t_d.norm(p=2) + 1e-8)).item())
+                accs.append(_compute_inception_score(t_gpu))
+                if step % fid_interval == 0 or step == len(cs_traj_q) - 1:
+                    feats = _extract_features(t_gpu)
+                    fids.append(_compute_fid(feats_real, feats))
+                    precisions.append(_compute_precision(feats_real, feats))
+                else:
+                    fids.append(None)
+                    precisions.append(None)
+
+            all_results[key] = {'l2_div': l2_divs, 'accuracy': accs, 'fid': fids, 'precision': precisions}
+            final_frames[key] = cs_traj_q[-1]
+            cross_step_keys.append(key)
+            print(f"{key} done. Final L2: {l2_divs[-1]:.4f} | IS: {accs[-1]:.4f} | FID: {fids[-1]:.2f} | Precision: {precisions[-1]:.4f}\n")
+
     # --- Summary table ---
     final_fid_def = next(v for v in reversed(default_fid) if v is not None)
     final_prec_def = next(v for v in reversed(default_precision) if v is not None)
-    print(f"\n{'Experiment':<10} | {'Avg L2 div':>10} | {'Final L2':>8} | {'Avg IS':>7} | {'Final FID':>9} | {'Final Prec':>10}")
-    print("-" * 68)
-    print(f"{'default':<10} | {'N/A':>10} | {'N/A':>8} | {np.mean(default_acc):>7.4f} | {final_fid_def:>9.2f} | {final_prec_def:>10.4f}")
-    for qt in quant_types:
-        r = all_results[qt]
+    all_exp_keys = quant_types + cross_step_keys
+    col_w = max(14, max((len(k) for k in all_exp_keys), default=0) + 2)
+    print(f"\n{'':<{col_w}} | {'Avg L2 div':>10} | {'Final L2':>8} | {'Avg IS':>7} | {'Final FID':>9} | {'Final Prec':>10}")
+    print("-" * (col_w + 56))
+    print(f"{'default':<{col_w}} | {'N/A':>10} | {'N/A':>8} | {np.mean(default_acc):>7.4f} | {final_fid_def:>9.2f} | {final_prec_def:>10.4f}")
+    for k in all_exp_keys:
+        r = all_results[k]
         final_fid = next(v for v in reversed(r['fid']) if v is not None)
         final_prec = next(v for v in reversed(r['precision']) if v is not None)
-        print(f"{qt:<10} | {np.mean(r['l2_div']):>10.4f} | {r['l2_div'][-1]:>8.4f} "
+        print(f"{k:<{col_w}} | {np.mean(r['l2_div']):>10.4f} | {r['l2_div'][-1]:>8.4f} "
               f"| {np.mean(r['accuracy']):>7.4f} | {final_fid:>9.2f} | {final_prec:>10.4f}")
 
     save_data = {
@@ -759,15 +912,19 @@ def quantization_figure(model_list_orig, select_idx):
     # --- Step 4: Plots (only non-None FID/precision steps) ---
     steps = list(range(FLAGS.num_steps))
     fid_steps = [s for s in steps if s % fid_interval == 0 or s == FLAGS.num_steps - 1]
-    colors = {'fp4': 'tab:blue', 'fp8': 'tab:orange', 'int8': 'tab:green', 'nf4': 'tab:red'}
+    colors = {'fp4': 'tab:blue', 'fp8': 'tab:orange', 'int8': 'tab:green', 'nf4': 'tab:red',
+              'cross_step': 'tab:purple',
+              'cross_step_fp4': 'tab:cyan', 'cross_step_fp8': 'tab:olive',
+              'cross_step_int8': 'tab:brown', 'cross_step_nf4': 'tab:pink'}
 
     fig, axes = plt.subplots(1, 4, figsize=(22, 5))
 
     # Plot 1: L2 divergence (every step)
     ax = axes[0]
     ax.axhline(0, color='black', linewidth=2.5, linestyle='--', label='default', zorder=10)
-    for qt in quant_types:
-        ax.plot(steps, all_results[qt]['l2_div'], label=qt, color=colors[qt])
+    for k in all_exp_keys:
+        ls = ':' if k.startswith('cross_step') else '-'
+        ax.plot(steps, all_results[k]['l2_div'], label=k, color=colors.get(k, None), linestyle=ls)
     ax.set_xlabel('MCMC step')
     ax.set_ylabel('Normalized L2 divergence')
     ax.set_title('L2 divergence vs default trajectory')
@@ -776,8 +933,9 @@ def quantization_figure(model_list_orig, select_idx):
 
     # Plot 2: Inception score (every step)
     ax = axes[1]
-    for qt in quant_types:
-        ax.plot(steps, all_results[qt]['accuracy'], label=qt, color=colors[qt], alpha=0.8)
+    for k in all_exp_keys:
+        ls = ':' if k.startswith('cross_step') else '-'
+        ax.plot(steps, all_results[k]['accuracy'], label=k, color=colors.get(k, None), linestyle=ls, alpha=0.8)
     ax.plot(steps, default_acc, label='default', color='black', linewidth=2.5, linestyle='--', zorder=10)
     ax.set_xlabel('MCMC step')
     ax.set_ylabel('Inception score (IS)')
@@ -787,8 +945,10 @@ def quantization_figure(model_list_orig, select_idx):
 
     # Plot 3: FID (every fid_interval steps)
     ax = axes[2]
-    for qt in quant_types:
-        ax.plot(fid_steps, [all_results[qt]['fid'][s] for s in fid_steps], label=qt, color=colors[qt], alpha=0.8)
+    for k in all_exp_keys:
+        ls = ':' if k.startswith('cross_step') else '-'
+        ax.plot(fid_steps, [all_results[k]['fid'][s] for s in fid_steps],
+                label=k, color=colors.get(k, None), linestyle=ls, alpha=0.8)
     ax.plot(fid_steps, [default_fid[s] for s in fid_steps], label='default', color='black', linewidth=2.5, linestyle='--', zorder=10)
     ax.set_xlabel('MCMC step')
     ax.set_ylabel('FID (lower = better)')
@@ -798,8 +958,10 @@ def quantization_figure(model_list_orig, select_idx):
 
     # Plot 4: Precision (every fid_interval steps)
     ax = axes[3]
-    for qt in quant_types:
-        ax.plot(fid_steps, [all_results[qt]['precision'][s] for s in fid_steps], label=qt, color=colors[qt], alpha=0.8)
+    for k in all_exp_keys:
+        ls = ':' if k.startswith('cross_step') else '-'
+        ax.plot(fid_steps, [all_results[k]['precision'][s] for s in fid_steps],
+                label=k, color=colors.get(k, None), linestyle=ls, alpha=0.8)
     ax.plot(fid_steps, [default_precision[s] for s in fid_steps], label='default', color='black', linewidth=2.5, linestyle='--', zorder=10)
     ax.set_xlabel('MCMC step')
     ax.set_ylabel('Precision (higher = better)')
@@ -808,7 +970,7 @@ def quantization_figure(model_list_orig, select_idx):
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    out_dir = "quant_results"
+    out_dir = FLAGS.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
     plt.tight_layout()
@@ -817,14 +979,14 @@ def quantization_figure(model_list_orig, select_idx):
 
     # Save final images (8×8 grid) for default and each quant type
     def save_grid(frame_cpu, name):
-        out = frame_cpu.numpy().transpose(0, 2, 3, 1)
+        out = frame_cpu[:64].numpy().transpose(0, 2, 3, 1)
         out = out.reshape(8, 8, im_size, im_size, 3).transpose(0, 2, 1, 3, 4).reshape(8 * im_size, 8 * im_size, 3)
         imsave(osp.join(out_dir, f"quant_{name}.png"), (out * 255).astype(np.uint8))
 
     save_grid(default_traj[-1], 'default')
-    for qt in quant_types:
-        save_grid(final_frames[qt], qt)
-        print(f"Saved {out_dir}/quant_{qt}.png")
+    for k in all_exp_keys:
+        save_grid(final_frames[k], k)
+        print(f"Saved {out_dir}/quant_{k}.png")
 
     np.save(osp.join(out_dir, 'quant_results.npy'), save_data)
     print(f"Saved per-step metrics to {out_dir}/quant_results.npy")
@@ -850,7 +1012,7 @@ def combine_main(models, resume_iters, select_idx):
         model_base = model_base.cuda()
         model_list.append(model_base)
 
-    quantization_figure(model_list, select_idx)
+    quantization_figure(model_list, select_idx, run_cross_step=FLAGS.cross_step)
 
 
 if __name__ == "__main__":
