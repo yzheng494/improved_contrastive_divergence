@@ -34,7 +34,7 @@ flags.DEFINE_bool('spec_norm', True, 'Whether to use spectral normalization on w
 flags.DEFINE_bool('use_bias', True, 'Whether to use bias in convolution')
 flags.DEFINE_bool('use_attention', False, 'Whether to use self attention in network')
 flags.DEFINE_integer('num_steps', 200, 'number of steps to optimize the label')
-flags.DEFINE_string('task', 'combination_figure', 'conceptcombine, combination_figure, negation_figure, or_figure, negation_eval')
+flags.DEFINE_string('task', 'combination_figure', 'conceptcombine, combination_figure, negation_figure, or_figure, negation_eval, step_schedule')
 
 flags.DEFINE_bool('eval', False, 'Whether to quantitively evaluate models')
 flags.DEFINE_bool('latent_energy', False, 'latent energy in model')
@@ -44,6 +44,7 @@ flags.DEFINE_integer('num_samples', 64, 'Number of images generated per MCMC ste
 flags.DEFINE_integer('fid_pca_dim', 0, 'PCA dimension before FID/precision (0 = no PCA; 256 recommended when num_samples >= 512)')
 flags.DEFINE_string('out_dir', 'quant_results', 'Directory to save output images, plots, and metrics')
 flags.DEFINE_bool('cross_step', False, 'Whether to also run cross-step inference (use g[t-2] instead of g[t-1])')
+flags.DEFINE_integer('mcmc_chunk', 16, 'Sub-batch size for chunked gradient computation; reduces peak GPU memory')
 
 
 # Whether to train for gentest
@@ -561,6 +562,96 @@ def _run_trajectory_cross_step(model_list_orig, labels, x0, n, im_size, quant_ty
     return trajectory
 
 
+def _chunked_grad(im, model_list, labels, n):
+    """Compute summed gradient across all models in sub-batches to bound peak GPU memory.
+
+    Processes images in chunks of FLAGS.mcmc_chunk; since energy = sum over images
+    the per-image gradients are independent, so this is mathematically identical to
+    a full-batch step.
+
+    Returns: grads tensor (same shape as im), detached.
+    """
+    chunk = FLAGS.mcmc_chunk
+    grads = torch.zeros_like(im)
+    for ci in range(0, n, chunk):
+        x_c = im[ci:ci + chunk].detach().requires_grad_(True)
+        lc = [l[ci:ci + chunk] if l is not None else None for l in labels]
+        e_c = None
+        for m, l in zip(model_list, lc):
+            e = m.forward(x_c, l)
+            e_c = e if e_c is None else e_c + e
+        g_c = torch.autograd.grad([e_c.sum()], [x_c])[0]
+        grads[ci:ci + chunk] = g_c.detach()
+        del x_c, e_c, g_c
+        torch.cuda.empty_cache()
+    return grads
+
+
+def _run_trajectory_with_steps(model_list, labels, x0, n, im_size, step_sizes):
+    """Run MCMC trajectory with an explicit per-step step size list.
+
+    Args:
+        step_sizes: list of floats, length == FLAGS.num_steps.
+    Returns:
+        List of CPU tensors (one per step).
+    """
+    trajectory = []
+    im = x0.clone()
+    for step in range(FLAGS.num_steps):
+        g_gen = torch.Generator(device='cuda')
+        g_gen.manual_seed(1000 + step)
+        noise = torch.empty(n, 3, im_size, im_size, device='cuda').normal_(generator=g_gen)
+        im = (im + 0.001 * noise).detach()
+        im_grad = _chunked_grad(im, model_list, labels, n)
+        im = (im - step_sizes[step] * im_grad).clamp(0, 1)
+        trajectory.append(im.cpu())
+    return trajectory
+
+
+def _run_trajectory_score_reversal(model_list, labels, x0, n, im_size,
+                                    eta_start, beta=0.9, eps=0.1, gamma=0.95):
+    """Score reversal adaptive step size.
+
+    The step size starts at eta_start and only ever decreases: when the
+    gradient norm exceeds the EMA baseline by more than eps, the step is
+    multiplied by gamma, floored at eta_min = 0.1 * eta_start.
+
+    Returns:
+        (trajectory, actual_steps) — list of CPU tensors and the step size used
+        at each MCMC step.
+    """
+    trajectory = []
+    actual_steps = []
+    im = x0.clone()
+    eta = eta_start
+    eta_min = 0.1 * eta_start
+    norm_ema = None
+
+    for step in range(FLAGS.num_steps):
+        g_gen = torch.Generator(device='cuda')
+        g_gen.manual_seed(1000 + step)
+        noise = torch.empty(n, 3, im_size, im_size, device='cuda').normal_(generator=g_gen)
+        im = (im + 0.001 * noise).detach()
+        im_grad = _chunked_grad(im, model_list, labels, n)
+
+        # Compute batch gradient norm and update exponential moving average
+        norm_t = im_grad.norm(p=2).item()
+        if norm_ema is None:
+            norm_ema = norm_t
+        else:
+            norm_ema = beta * norm_ema + (1.0 - beta) * norm_t
+
+        # Reduce step on overshoot
+        if norm_t > norm_ema * (1.0 + eps):
+            eta = max(eta * gamma, eta_min)
+
+        actual_steps.append(eta)
+        im = (im - eta * im_grad).clamp(0, 1)
+        trajectory.append(im.cpu())
+
+    return trajectory, actual_steps
+
+
 _inception_model = None
 _inception_logits_model = None
 
@@ -621,17 +712,23 @@ def _compute_fid(feats_real, feats_fake):
     return float(diff @ diff + np.trace(sigma_r + sigma_f - 2 * covmean))
 
 
-def _compute_precision(feats_real, feats_fake, k=3):
-    """Precision: fraction of fake samples within the real manifold (k-NN)."""
+def _compute_precision(feats_real, feats_fake, k=10):
+    """Precision: fraction of fake samples within the real manifold (k-NN).
+
+    For each real sample, its neighborhood radius = distance to its k-th nearest
+    real neighbor. A fake sample is 'in the manifold' if it falls inside ANY real
+    sample's ball (Kynkäänniemi et al. 2019), not just its single nearest neighbor.
+    """
     from sklearn.neighbors import NearestNeighbors
     r, f = _maybe_pca(feats_real, feats_fake)
     nbrs = NearestNeighbors(n_neighbors=k+1).fit(r)
     dists_real, _ = nbrs.kneighbors(r)
-    radii = dists_real[:, -1]
-    nearest_real_dist = nbrs.kneighbors(f, n_neighbors=1, return_distance=True)[0][:, 0]
-    nearest_real_idx  = nbrs.kneighbors(f, n_neighbors=1, return_distance=False)[:, 0]
-    precision = float((nearest_real_dist <= radii[nearest_real_idx]).mean())
-    return precision
+    radii = dists_real[:, -1]  # distance to k-th nearest real neighbor (index 0 = self)
+    # For each fake sample, find its k nearest real neighbors and check if it
+    # falls inside ANY of their balls (fixes the single-neighbor underestimation bug)
+    dists_to_real, idx = nbrs.kneighbors(f, n_neighbors=k)
+    in_manifold = (dists_to_real <= radii[idx]).any(axis=1)
+    return float(in_manifold.mean())
 
 
 def _get_inception():
@@ -994,10 +1091,344 @@ def quantization_figure(model_list_orig, select_idx, run_cross_step=False):
     return save_data
 
 
-def combine_main(models, resume_iters, select_idx):
+def step_schedule_figure(model_list_orig, select_idx):
+    """Compare three sampling strategies: fixed step size, cosine schedule, score reversal.
 
+    For each strategy several parameter configurations are evaluated.
+    FID and Precision are computed every fid_interval steps and plotted together,
+    with the default (1x fixed step) shown as a dashed baseline in every subplot.
+
+    Output (saved to FLAGS.out_dir/step_schedule/):
+      step_schedule_fid_precision.png  — 2×3 grid: (FID, Precision) × (Fixed, Cosine, Score-Reversal)
+      step_schedule_step_sizes.png     — actual step sizes used by Cosine and Score-Reversal variants
+      step_schedule_results.npy        — per-step metrics dict
+    """
+    import math
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    n = FLAGS.num_samples
+    im_size = 128
+    fid_interval = 5
+    T_cosine = 50   # cosine annealing period (steps)
+
+    # ------------------------------------------------------------------
+    # Real image features for FID / precision
+    # ------------------------------------------------------------------
+    import pandas as pd
+    from torchvision import transforms as T
+
+    attr_cols  = [39, 20, 31, 33]
+    attr_signs = [(-1, 1), (1, -1), (1, -1), (-1, 1)]
+    print("=== [step_schedule] Extracting real CelebA features ===")
+    celeba_dir = "data/celeba/img_align_celeba"
+    attr_df    = pd.read_csv("data/celeba/list_attr_celeba.txt", sep=r"\s+", skiprows=1)
+    mask = np.ones(len(attr_df), dtype=bool)
+    for col_idx, (val1, val0), six in zip(attr_cols, attr_signs, select_idx):
+        col_name = attr_df.columns[col_idx]
+        expected = val1 if six == 1 else val0
+        mask &= (attr_df[col_name].values == expected)
+    filtered_files = attr_df.index[mask].tolist()
+    print(f"  Found {len(filtered_files)} real images matching attributes")
+    np.random.seed(0)
+    chosen = np.random.choice(filtered_files, size=min(2000, len(filtered_files)), replace=False)
+    to_tensor = T.Compose([T.Resize((128, 128)), T.ToTensor()])
+    real_imgs = []
+    for fname in chosen:
+        img = Image.open(osp.join(celeba_dir, fname)).convert('RGB')
+        real_imgs.append(to_tensor(img))
+    real_imgs = torch.stack(real_imgs).cuda()
+    feats_real = _extract_features(real_imgs)
+    print(f"  Real features: {feats_real.shape}\n")
+    del real_imgs
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Labels
+    # ------------------------------------------------------------------
+    labels = []
+    for six in select_idx:
+        label_ix = np.eye(2)[six]
+        label_batch = np.tile(label_ix[None, :], (n, 1))
+        labels.append(torch.Tensor(label_batch).cuda())
+
+    # ------------------------------------------------------------------
+    # Warm-up augmentation
+    # ------------------------------------------------------------------
+    color_jitter = transforms.ColorJitter(0.8, 0.8, 0.8, 0.4)
+    rnd_color_jitter = transforms.RandomApply([color_jitter], p=0.8)
+    rnd_gray = transforms.RandomGrayscale(p=0.2)
+    aug_transform = transforms.Compose([
+        transforms.RandomResizedCrop(im_size, scale=(0.08, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.Compose([rnd_color_jitter, rnd_gray]),
+        transforms.ToTensor(),
+    ])
+
+    if _inception_model is not None:
+        _inception_model.cpu()
+        torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Shared warm-up → x0
+    # ------------------------------------------------------------------
+    print("=== [step_schedule] Warm-up → x0 ===")
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    im = torch.rand(n, 3, im_size, im_size).cuda()
+    im_noise = torch.randn_like(im).detach()
+    for _ in range(10):
+        for _ in range(20):
+            im_noise.normal_()
+            im = (im + 0.001 * im_noise).detach()
+            im_grad = _chunked_grad(im, model_list_orig, labels, n)
+            im = (im - FLAGS.step_lr * im_grad).clamp(0, 1)
+        im_np = (im.detach().cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+        ims_aug = [np.array(aug_transform(Image.fromarray(im_np[i]))) for i in range(n)]
+        im = torch.tensor(np.array(ims_aug)).cuda()
+    x0 = im.detach().clone()
+    print("  x0 ready.\n")
+
+    eta_base = FLAGS.step_lr  # already divided by num models in __main__
+
+    # ------------------------------------------------------------------
+    # Helper: evaluate a trajectory list → (fid_list, prec_list)
+    # fid_list[s] is None unless s % fid_interval == 0 or s == last step
+    # ------------------------------------------------------------------
+    def _eval_traj(traj):
+        if _inception_model is not None:
+            _inception_model.cuda()
+        fids, precs = [], []
+        for step, t in enumerate(traj):
+            if step % fid_interval == 0 or step == len(traj) - 1:
+                feats = _extract_features(t.cuda())
+                fids.append(_compute_fid(feats_real, feats))
+                precs.append(_compute_precision(feats_real, feats))
+            else:
+                fids.append(None)
+                precs.append(None)
+        if _inception_model is not None:
+            _inception_model.cpu()
+            torch.cuda.empty_cache()
+        return fids, precs
+
+    steps = list(range(FLAGS.num_steps))
+    fid_steps = [s for s in steps if s % fid_interval == 0 or s == FLAGS.num_steps - 1]
+
+    all_results = {}   # key -> {'fid': [...], 'precision': [...], 'step_sizes': [...]}
+
+    # ==================================================================
+    # Strategy 1: Fixed step sizes — 1x, 2x, 4x, 8x
+    # ==================================================================
+    fixed_configs = [
+        ('fixed_1x',  1.0),
+        ('fixed_2x',  2.0),
+        ('fixed_4x',  4.0),
+        ('fixed_8x',  8.0),
+    ]
+    print("=== Strategy 1: Fixed step sizes ===")
+    for name, mult in fixed_configs:
+        if _inception_model is not None:
+            _inception_model.cpu()
+            torch.cuda.empty_cache()
+        step_sizes = [eta_base * mult] * FLAGS.num_steps
+        model_copy = [copy.deepcopy(m) for m in model_list_orig]
+        traj = _run_trajectory_with_steps(model_copy, labels, x0, n, im_size, step_sizes)
+        del model_copy
+        torch.cuda.empty_cache()
+        fids, precs = _eval_traj(traj)
+        all_results[name] = {
+            'fid': fids, 'precision': precs,
+            'step_sizes': step_sizes,
+        }
+        final_fid  = next(v for v in reversed(fids)  if v is not None)
+        final_prec = next(v for v in reversed(precs) if v is not None)
+        print(f"  {name}: Final FID={final_fid:.2f}  Precision={final_prec:.4f}")
+    print()
+
+    # ==================================================================
+    # Strategy 2: Cosine annealing schedule  (T = T_cosine steps)
+    # η_t = η_end + 0.5*(η_start−η_end)*(1 + cos(π·t/T))
+    # After t ≥ T, η = η_end (flat tail)
+    # ==================================================================
+    cosine_configs = [
+        ('cosine_4x_1x',    eta_base * 4,  eta_base * 1.0),
+        ('cosine_4x_0.1x',  eta_base * 4,  eta_base * 0.1),
+        ('cosine_8x_1x',    eta_base * 8,  eta_base * 1.0),
+        ('cosine_8x_0.5x',  eta_base * 8,  eta_base * 0.5),
+    ]
+    print(f"=== Strategy 2: Cosine schedule (T={T_cosine}) ===")
+    for name, eta_start, eta_end in cosine_configs:
+        schedule = []
+        for t in range(FLAGS.num_steps):
+            if t >= T_cosine:
+                schedule.append(eta_end)
+            else:
+                eta = eta_end + 0.5 * (eta_start - eta_end) * (1 + math.cos(math.pi * t / T_cosine))
+                schedule.append(eta)
+
+        if _inception_model is not None:
+            _inception_model.cpu()
+            torch.cuda.empty_cache()
+        model_copy = [copy.deepcopy(m) for m in model_list_orig]
+        traj = _run_trajectory_with_steps(model_copy, labels, x0, n, im_size, schedule)
+        del model_copy
+        torch.cuda.empty_cache()
+        fids, precs = _eval_traj(traj)
+        all_results[name] = {
+            'fid': fids, 'precision': precs,
+            'step_sizes': schedule,
+        }
+        final_fid  = next(v for v in reversed(fids)  if v is not None)
+        final_prec = next(v for v in reversed(precs) if v is not None)
+        print(f"  {name}: Final FID={final_fid:.2f}  Precision={final_prec:.4f}")
+    print()
+
+    # ==================================================================
+    # Strategy 3: Score reversal (adaptive, monotonically decreasing)
+    # ==================================================================
+    sr_configs = [
+        # (name,            eta_start,       beta,  eps,  gamma)
+        ('sr_2x_b0.9_e0.1', eta_base * 2.0, 0.9, 0.10, 0.95),
+        ('sr_4x_b0.9_e0.1', eta_base * 4.0, 0.9, 0.10, 0.95),
+        ('sr_2x_b0.9_e0.05', eta_base * 2.0, 0.9, 0.05, 0.90),
+        ('sr_4x_b0.8_e0.15', eta_base * 4.0, 0.8, 0.15, 0.90),
+    ]
+    print("=== Strategy 3: Score reversal ===")
+    for name, eta_start, beta, eps, gamma in sr_configs:
+        if _inception_model is not None:
+            _inception_model.cpu()
+            torch.cuda.empty_cache()
+        model_copy = [copy.deepcopy(m) for m in model_list_orig]
+        traj, actual_steps = _run_trajectory_score_reversal(
+            model_copy, labels, x0, n, im_size,
+            eta_start=eta_start, beta=beta, eps=eps, gamma=gamma
+        )
+        del model_copy
+        torch.cuda.empty_cache()
+        fids, precs = _eval_traj(traj)
+        all_results[name] = {
+            'fid': fids, 'precision': precs,
+            'step_sizes': actual_steps,
+        }
+        final_fid  = next(v for v in reversed(fids)  if v is not None)
+        final_prec = next(v for v in reversed(precs) if v is not None)
+        final_eta  = actual_steps[-1]
+        print(f"  {name}: Final FID={final_fid:.2f}  Precision={final_prec:.4f}  final_eta={final_eta:.1f}")
+    print()
+
+    # ------------------------------------------------------------------
+    # Save data
+    # ------------------------------------------------------------------
+    out_dir = osp.join(FLAGS.out_dir, 'step_schedule')
+    os.makedirs(out_dir, exist_ok=True)
+    np.save(osp.join(out_dir, 'step_schedule_results.npy'), all_results)
+    print(f"Saved per-step metrics to {out_dir}/step_schedule_results.npy")
+
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+    # Colors per group
+    fixed_keys   = [k for k in all_results if k.startswith('fixed_')]
+    cosine_keys  = [k for k in all_results if k.startswith('cosine_')]
+    sr_keys      = [k for k in all_results if k.startswith('sr_')]
+
+    fixed_colors  = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
+    cosine_colors = ['tab:purple', 'tab:brown', 'tab:pink', 'tab:cyan']
+    sr_colors     = ['tab:olive', 'tab:gray', 'steelblue', 'tomato']
+
+    def _get_fid_vals(key):
+        return [all_results[key]['fid'][s] for s in fid_steps]
+
+    def _get_prec_vals(key):
+        return [all_results[key]['precision'][s] for s in fid_steps]
+
+    # --- Figure 1: FID and Precision for the three strategy groups ---
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    group_info = [
+        ('Fixed step size',     fixed_keys,  fixed_colors),
+        ('Cosine schedule',     cosine_keys, cosine_colors),
+        ('Score reversal',      sr_keys,     sr_colors),
+    ]
+    default_fid_vals  = _get_fid_vals('fixed_1x')
+    default_prec_vals = _get_prec_vals('fixed_1x')
+
+    for col, (title, keys, colors) in enumerate(group_info):
+        # FID row
+        ax = axes[0][col]
+        ax.plot(fid_steps, default_fid_vals, color='black', linewidth=2.5,
+                linestyle='--', label='default (1x)', zorder=10)
+        for key, color in zip(keys, colors):
+            if key == 'fixed_1x':
+                continue  # already drawn as baseline
+            ax.plot(fid_steps, _get_fid_vals(key), label=key, color=color)
+        ax.set_xlabel('MCMC step')
+        ax.set_ylabel('FID (lower = better)')
+        ax.set_title(f'{title}\nFID vs MCMC steps')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+        # Precision row
+        ax = axes[1][col]
+        ax.plot(fid_steps, default_prec_vals, color='black', linewidth=2.5,
+                linestyle='--', label='default (1x)', zorder=10)
+        for key, color in zip(keys, colors):
+            if key == 'fixed_1x':
+                continue
+            ax.plot(fid_steps, _get_prec_vals(key), label=key, color=color)
+        ax.set_xlabel('MCMC step')
+        ax.set_ylabel('Precision (higher = better)')
+        ax.set_title(f'{title}\nPrecision vs MCMC steps')
+        ax.set_ylim(0, 1)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle('Sampling step-size schedules: FID & Precision vs MCMC steps', fontsize=13)
+    plt.tight_layout()
+    plot_path = osp.join(out_dir, 'step_schedule_fid_precision.png')
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"Saved FID/Precision plot to {plot_path}")
+
+    # --- Figure 2: Actual step sizes used ---
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for col, (title, keys, colors) in enumerate(group_info):
+        ax = axes[col]
+        ax.axhline(eta_base, color='black', linewidth=2, linestyle='--',
+                   label='default (1x)', zorder=10)
+        for key, color in zip(keys, colors):
+            ax.plot(steps, all_results[key]['step_sizes'], label=key, color=color)
+        ax.set_xlabel('MCMC step')
+        ax.set_ylabel('Step size η')
+        ax.set_title(f'{title}\nActual step size per MCMC step')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle('Sampling step sizes over MCMC trajectory', fontsize=13)
+    plt.tight_layout()
+    step_plot_path = osp.join(out_dir, 'step_schedule_step_sizes.png')
+    plt.savefig(step_plot_path, dpi=150)
+    plt.close()
+    print(f"Saved step-size plot to {step_plot_path}")
+
+    # --- Summary table ---
+    all_keys = fixed_keys + cosine_keys + sr_keys
+    col_w = max(18, max(len(k) for k in all_keys) + 2)
+    print(f"\n{'Config':<{col_w}} | {'Final FID':>9} | {'Final Prec':>10} | {'Final η':>10}")
+    print('-' * (col_w + 40))
+    for k in all_keys:
+        fid_v  = next(v for v in reversed(all_results[k]['fid'])       if v is not None)
+        prec_v = next(v for v in reversed(all_results[k]['precision'])  if v is not None)
+        eta_v  = all_results[k]['step_sizes'][-1]
+        print(f"{k:<{col_w}} | {fid_v:>9.2f} | {prec_v:>10.4f} | {eta_v:>10.2f}")
+
+    return all_results
+
+
+def _load_model_list(models, resume_iters):
+    """Load CelebA EBM checkpoints and return a list of cuda models."""
     model_list = []
-
     for model, resume_iter in zip(models, resume_iters):
         model_path = osp.join("cachedir", model, "model_{}.pth".format(resume_iter))
         checkpoint = torch.load(model_path)
@@ -1011,8 +1442,17 @@ def combine_main(models, resume_iters, select_idx):
         model_base.load_state_dict(checkpoint['ema_model_state_dict_0'])
         model_base = model_base.cuda()
         model_list.append(model_base)
+    return model_list
 
+
+def combine_main(models, resume_iters, select_idx):
+    model_list = _load_model_list(models, resume_iters)
     quantization_figure(model_list, select_idx, run_cross_step=FLAGS.cross_step)
+
+
+def step_schedule_main(models, resume_iters, select_idx):
+    model_list = _load_model_list(models, resume_iters)
+    step_schedule_figure(model_list, select_idx)
 
 
 if __name__ == "__main__":
@@ -1024,28 +1464,15 @@ if __name__ == "__main__":
 
     ##################################
     # Settings for the composition_figure
-    models = []
-    resume_iters = []
-    select_idx = []
-    models = [models_orig[1]]
-    resume_iters = [resume_iters_orig[1]]
-    select_idx = [1]
-
-    models = models + [models_orig[0]]
-    resume_iters = resume_iters + [resume_iters_orig[0]]
-    select_idx = select_idx + [1]
-
-    models = models + [models_orig[2]]
-    resume_iters = resume_iters + [resume_iters_orig[2]]
-    select_idx = select_idx + [1]
-
-    models = models + [models_orig[3]]
-    resume_iters = resume_iters + [resume_iters_orig[3]]
-    select_idx = select_idx + [0]
+    models = [models_orig[1], models_orig[0], models_orig[2], models_orig[3]]
+    resume_iters = [resume_iters_orig[1], resume_iters_orig[0], resume_iters_orig[2], resume_iters_orig[3]]
+    select_idx = [1, 1, 1, 0]
 
     FLAGS.step_lr = FLAGS.step_lr / len(models)
 
-    # List of 4 attributes that might be good
-    # Young -> Female -> Smiling -> Wavy
-    combine_main(models, resume_iters, select_idx)
+    if FLAGS.task == 'step_schedule':
+        step_schedule_main(models, resume_iters, select_idx)
+    else:
+        # Default: quantization comparison figure
+        combine_main(models, resume_iters, select_idx)
 

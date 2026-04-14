@@ -75,6 +75,9 @@ flags.DEFINE_string('quant_type', 'none',
     'Weight quantization: "none" | "fp4" | "fp8" | "int8" | "nf4"')
 flags.DEFINE_integer('mcmc_chunk_size', 64,
     'Sub-batch size for chunked MCMC gradient computation (reduces peak GPU memory)')
+flags.DEFINE_bool('rank_comparison', True,
+    'When num_seeds>=4: compare worst/rank-N//4/rank-N//2/best seeds as proxies '
+    'for 1-seed/4-seed/8-seed/N-seed experiments instead of single-vs-multi.')
 
 FLAGS = flags.FLAGS
 
@@ -169,7 +172,7 @@ def _compute_fid(feats_real, feats_fake):
     return float(diff @ diff + np.trace(sig_r + sig_f - 2 * cov))
 
 
-def _compute_precision(feats_real, feats_fake, k=3):
+def _compute_precision(feats_real, feats_fake, k=10):
     from sklearn.neighbors import NearestNeighbors
     r, f = _maybe_pca(feats_real, feats_fake)
     nbrs = NearestNeighbors(n_neighbors=k+1).fit(r)
@@ -377,16 +380,32 @@ def multi_seed_inference(model_list_orig, select_idx):
     _offload_inception()
     feats_real = _load_real_features(select_idx)
 
+    # ── Rank comparison mode ───────────────────────────────────────────────────
+    # When enabled, seeds are sorted worst→best by score_metric at each checkpoint
+    # and we record metrics for ranks [1, N//4, N//2, N] as proxies for
+    # "best-of-1", "best-of-N//4", "best-of-N//2", "best-of-N" experiments.
+    use_rank_cmp = FLAGS.rank_comparison and num_seeds >= 4
+    if use_rank_cmp:
+        raw = sorted({1, num_seeds // 4, num_seeds // 2, num_seeds})
+        rank_tiers = [t for t in raw if 1 <= t <= num_seeds]
+        print(f"Rank-comparison mode: tiers = {rank_tiers} "
+              f"(proxies for best-of-{rank_tiers} experiments)\n")
+
     # ── Accumulators ──────────────────────────────────────────────────────────
     # per_step_results[step][label][metric] = list of trial values
-    # labels: 'single', 'multi', (optionally 'ref' when quant)
-    labels_used = ['single', 'multi'] + (['ref'] if quant_type != 'none' else [])
+    if use_rank_cmp:
+        labels_used = [f'rank_{t}' for t in rank_tiers]
+    else:
+        labels_used = ['single', 'multi'] + (['ref'] if quant_type != 'none' else [])
     metrics     = ['is', 'fid', 'precision']
 
     per_step = {
         step: {lbl: {m: [] for m in metrics} for lbl in labels_used}
         for step in eval_steps
     }
+    # all_seed_scores[step][trial][seed_idx] = {'is':..,'fid':..,'precision':..}
+    # Saves raw scores for every seed so nothing is discarded.
+    all_seed_scores = {step: [] for step in eval_steps}
     all_trial_energies = []   # (num_trials, num_seeds)
     best_seed_indices  = []
 
@@ -436,34 +455,58 @@ def multi_seed_inference(model_list_orig, select_idx):
             for s_ckpts in seed_ckpts:
                 seed_scores.append(_score_batch(s_ckpts[step], feats_real))
 
-            # Pick best seed
+            # Sort seed indices worst → best by score_metric
             if FLAGS.score_metric == 'energy':
-                best_idx = int(np.argmin(seed_energies))
-            elif FLAGS.score_metric == 'is':
-                best_idx = int(np.argmax([s['is']  for s in seed_scores]))
+                sort_key = seed_energies          # lower=better → worst = highest
+                sorted_idx = list(np.argsort(sort_key)[::-1])
             elif FLAGS.score_metric == 'fid':
-                best_idx = int(np.argmin([s['fid'] for s in seed_scores]))
+                sort_key = [s['fid'] for s in seed_scores]   # lower=better
+                sorted_idx = list(np.argsort(sort_key)[::-1])
             elif FLAGS.score_metric == 'precision':
-                best_idx = int(np.argmax([s['precision'] for s in seed_scores]))
+                sort_key = [s['precision'] for s in seed_scores]  # higher=better
+                sorted_idx = list(np.argsort(sort_key))
+            else:  # 'is'
+                sort_key = [s['is'] for s in seed_scores]    # higher=better
+                sorted_idx = list(np.argsort(sort_key))
+            # sorted_idx[0] = worst seed, sorted_idx[-1] = best seed
+
+            best_idx = sorted_idx[-1]
+
+            # Save raw scores for all seeds at this step / trial
+            all_seed_scores[step].append(seed_scores)   # list of num_seeds dicts
+
+            if use_rank_cmp:
+                # Record metrics for each rank tier (1-indexed from worst)
+                log_parts = [f"step={step:3d}"]
+                for t in rank_tiers:
+                    chosen = sorted_idx[t - 1]   # t=1 → worst, t=N → best
+                    lbl = f'rank_{t}'
+                    for m in metrics:
+                        per_step[step][lbl][m].append(seed_scores[chosen][m])
+                    log_parts.append(
+                        f"rank{t:2d}[seed{chosen}] "
+                        f"IS={seed_scores[chosen]['is']:.3f} "
+                        f"FID={seed_scores[chosen]['fid']:.1f} "
+                        f"Prec={seed_scores[chosen]['precision']:.3f}")
+                print("  " + " | ".join(log_parts))
             else:
-                best_idx = int(np.argmax([s['is']  for s in seed_scores]))
-
-            # Record single (seed 0) and multi (best) metrics
-            for m in metrics:
-                per_step[step]['single'][m].append(seed_scores[0][m])
-                per_step[step]['multi'][m].append(seed_scores[best_idx][m])
-
-            # Reference (unquantized) if applicable
-            if ref_ckpts is not None:
-                ref_scores = _score_batch(ref_ckpts[step], feats_real)
+                # Original single-vs-multi mode
                 for m in metrics:
-                    per_step[step]['ref'][m].append(ref_scores[m])
+                    per_step[step]['single'][m].append(seed_scores[0][m])
+                    per_step[step]['multi'][m].append(seed_scores[best_idx][m])
 
-            print(f"  step={step:3d} | "
-                  f"single IS={seed_scores[0]['is']:.3f} FID={seed_scores[0]['fid']:.1f} Prec={seed_scores[0]['precision']:.3f} | "
-                  f"multi  IS={seed_scores[best_idx]['is']:.3f} FID={seed_scores[best_idx]['fid']:.1f} Prec={seed_scores[best_idx]['precision']:.3f}"
-                  + (f" | ref IS={ref_scores['is']:.3f} FID={ref_scores['fid']:.1f} Prec={ref_scores['precision']:.3f}"
-                     if ref_ckpts is not None else ""))
+                # Reference (unquantized) if applicable
+                ref_scores = None
+                if ref_ckpts is not None:
+                    ref_scores = _score_batch(ref_ckpts[step], feats_real)
+                    for m in metrics:
+                        per_step[step]['ref'][m].append(ref_scores[m])
+
+                print(f"  step={step:3d} | "
+                      f"single IS={seed_scores[0]['is']:.3f} FID={seed_scores[0]['fid']:.1f} Prec={seed_scores[0]['precision']:.3f} | "
+                      f"multi  IS={seed_scores[best_idx]['is']:.3f} FID={seed_scores[best_idx]['fid']:.1f} Prec={seed_scores[best_idx]['precision']:.3f}"
+                      + (f" | ref IS={ref_scores['is']:.3f} FID={ref_scores['fid']:.1f} Prec={ref_scores['precision']:.3f}"
+                         if ref_scores is not None else ""))
 
         if len(best_seed_indices) == trial:
             # Record the best_idx from the final step
@@ -472,10 +515,17 @@ def multi_seed_inference(model_list_orig, select_idx):
         # Save images for trial 0
         if trial == 0:
             final_step = eval_steps[-1]
-            _save_image_grid(seed_ckpts[0][final_step], im_size,
-                             osp.join(FLAGS.out_dir, 'single_seed_trial0.png'))
-            _save_image_grid(seed_ckpts[best_idx][final_step], im_size,
-                             osp.join(FLAGS.out_dir, 'multi_seed_best_trial0.png'))
+            if use_rank_cmp:
+                for t in rank_tiers:
+                    chosen = sorted_idx[t - 1]
+                    _save_image_grid(
+                        seed_ckpts[chosen][final_step], im_size,
+                        osp.join(FLAGS.out_dir, f'rank_{t}_seed{chosen}_trial0.png'))
+            else:
+                _save_image_grid(seed_ckpts[0][final_step], im_size,
+                                 osp.join(FLAGS.out_dir, 'single_seed_trial0.png'))
+                _save_image_grid(seed_ckpts[best_idx][final_step], im_size,
+                                 osp.join(FLAGS.out_dir, 'multi_seed_best_trial0.png'))
             _save_all_seeds_grid(
                 [ckpts[final_step] for ckpts in seed_ckpts],
                 im_size, best_idx,
@@ -484,21 +534,33 @@ def multi_seed_inference(model_list_orig, select_idx):
     # ── Summary ───────────────────────────────────────────────────────────────
     final = eval_steps[-1]
     print("\n" + "="*60 + "\nSUMMARY  (final step)\n" + "="*60)
-    header = f"{'Metric':<12}"
-    if 'ref' in labels_used:
-        header += f" | {'Ref (no quant)':>14}"
-    header += f" | {f'Quantized single ({quant_type})' if quant_type!='none' else 'Single seed':>20} | {'Best of %d' % num_seeds:>10} | {'Δ (multi-single)':>16}"
-    print(header)
-    print("-" * len(header))
-    for metric in metrics:
-        row = f"{metric:<12}"
+    if use_rank_cmp:
+        col_w = 12
+        header = f"{'Metric':<12}" + "".join(
+            f" | {'best-of-'+str(t):>{col_w}}" for t in rank_tiers)
+        print(header)
+        print("-" * len(header))
+        for metric in metrics:
+            row = f"{metric:<12}"
+            for t in rank_tiers:
+                row += f" | {np.mean(per_step[final][f'rank_{t}'][metric]):>{col_w}.4f}"
+            print(row)
+    else:
+        header = f"{'Metric':<12}"
         if 'ref' in labels_used:
-            row += f" | {np.mean(per_step[final]['ref'][metric]):>14.4f}"
-        s = np.mean(per_step[final]['single'][metric])
-        m = np.mean(per_step[final]['multi'][metric])
-        d = m - s
-        row += f" | {s:>20.4f} | {m:>10.4f} | {d:>+16.4f}"
-        print(row)
+            header += f" | {'Ref (no quant)':>14}"
+        header += f" | {f'Quantized single ({quant_type})' if quant_type!='none' else 'Single seed':>20} | {'Best of %d' % num_seeds:>10} | {'Δ (multi-single)':>16}"
+        print(header)
+        print("-" * len(header))
+        for metric in metrics:
+            row = f"{metric:<12}"
+            if 'ref' in labels_used:
+                row += f" | {np.mean(per_step[final]['ref'][metric]):>14.4f}"
+            s = np.mean(per_step[final]['single'][metric])
+            m = np.mean(per_step[final]['multi'][metric])
+            d = m - s
+            row += f" | {s:>20.4f} | {m:>10.4f} | {d:>+16.4f}"
+            print(row)
 
     # ── Plots ─────────────────────────────────────────────────────────────────
     _plot_metric_figures(per_step, eval_steps, labels_used, num_seeds, quant_type)
@@ -506,6 +568,8 @@ def multi_seed_inference(model_list_orig, select_idx):
 
     np.save(osp.join(FLAGS.out_dir, 'multi_seed_results.npy'), {
         'per_step': per_step,
+        # all_seed_scores[step][trial] = list of num_seeds dicts {is, fid, precision}
+        'all_seed_scores': all_seed_scores,
         'all_trial_energies': all_trial_energies,
         'best_seed_indices':  best_seed_indices,
         'eval_steps': eval_steps,
@@ -524,6 +588,7 @@ _METRIC_CFG = {
     'precision': ('Precision',        'Precision (higher = better)', True),
 }
 
+# Colors/styles for non-rank mode
 _COLOR = {
     'single': '#4c72b0',
     'multi':  '#dd8452',
@@ -539,27 +604,40 @@ _LABEL_NOQUANT = {
     'multi':  'Best of N seeds',
 }
 
+# Colors for rank-comparison mode (light→dark = worst→best)
+_RANK_COLORS = ['#aec7e8', '#6baed6', '#2171b5', '#08306b']
+_RANK_STYLES = [':', '--', '-.', '-']
+
 
 def _plot_metric_figures(per_step, eval_steps, labels_used, num_seeds, quant_type):
     x = np.array(eval_steps)
 
+    # Detect rank-comparison mode from label names
+    is_rank_mode = any(lbl.startswith('rank_') for lbl in labels_used)
+
     for metric, (title, ylabel, higher_better) in _METRIC_CFG.items():
         fig, ax = plt.subplots(figsize=(8, 5))
 
-        for lbl in labels_used:
+        for i, lbl in enumerate(labels_used):
             vals   = np.array([per_step[s][lbl][metric] for s in eval_steps])  # (steps, trials)
             mean_v = vals.mean(axis=1)
             std_v  = vals.std(axis=1)
-            color  = _COLOR[lbl]
 
-            if quant_type == 'none':
-                label = _LABEL_NOQUANT.get(lbl, lbl)
+            if is_rank_mode:
+                t     = int(lbl.split('_')[1])   # rank_{t}
+                color = _RANK_COLORS[i % len(_RANK_COLORS)]
+                ls    = _RANK_STYLES[i % len(_RANK_STYLES)]
+                label = f'best-of-{t}  (rank {t}/{num_seeds})'
             else:
-                label = _LABEL.get(lbl, lbl)
-            if lbl == 'multi':
-                label = label.replace('N', str(num_seeds))
+                color = _COLOR[lbl]
+                if quant_type == 'none':
+                    label = _LABEL_NOQUANT.get(lbl, lbl)
+                else:
+                    label = _LABEL.get(lbl, lbl)
+                if lbl == 'multi':
+                    label = label.replace('N', str(num_seeds))
+                ls = '--' if lbl == 'single' else ('-' if lbl == 'multi' else ':')
 
-            ls = '--' if lbl == 'single' else ('-' if lbl == 'multi' else ':')
             ax.plot(x, mean_v, ls, color=color, label=label, linewidth=2)
             ax.fill_between(x, mean_v - std_v, mean_v + std_v,
                             color=color, alpha=0.15)
@@ -567,7 +645,7 @@ def _plot_metric_figures(per_step, eval_steps, labels_used, num_seeds, quant_typ
         ax.set_xlabel('MCMC step')
         ax.set_ylabel(ylabel)
         ax.set_title(f'{title} over MCMC steps\n'
-                     f'(best seed selection: {FLAGS.score_metric}, '
+                     f'(sorted by: {FLAGS.score_metric}, '
                      f'{FLAGS.num_trials} trials)'
                      + (f'\n[{quant_type} quantization]' if quant_type != 'none' else ''))
         ax.legend()
