@@ -274,21 +274,38 @@ def _run_fixed(model_list, labels, x0, n, im_size, step_size):
 # ─── BARS trajectory ──────────────────────────────────────────────────────────
 
 def _run_bars(model_list, labels, x0, n, im_size,
-              eta_hi, beta=0.1, window=10, psi_th=2.0):
+              eta_1, eta_2, window=10, psi_th=2.0):
     """BARS (Basin-Aware Rollback Sampling).
 
-    Algorithm
-    ─────────
-    EXPLORE phase: use η_hi.  After *window* steps, check the oscillation ratio
-      ψ = total_variation / |net_decrease|.  Trigger rollback when:
-        • ψ ≥ ψ_th  (heavy zigzag oscillation), OR
-        • net_decrease ≤ 0 AND e_t > e_best  (steady divergence past x*)
+    Parameters
+    ----------
+    eta_1   : float  exploration step size (EXPLORE phase)
+    eta_2   : float  refinement step size  (REFINE phase)
+    window  : int    sliding window length w
+    psi_th  : float  oscillation threshold ψ
 
-    On rollback: teleport x_t → x_best, switch to REFINE (η_lo = β·η_hi).
-    REFINE phase: count *stale* steps (no improvement).  When stale ≥ window,
-      declare done, teleport to x_best, pad trace with flat tail.
+    Algorithm (matches spec exactly)
+    ─────────────────────────────────
+    State: phase ∈ {EXPLORE, REFINE}, x_best, e_best, e_buf, stale, done.
 
-    Energy proxy: e_t = mean_batch( ‖∇_x ΣE_i(x_t)‖₂ )  (pre-update)
+    Per step:
+      1. Compute e_t = mean(‖∇_x ΣE_i(x_t)‖₂)  [pre-update, pre-noise]
+      2. Update best state:
+           if e_t < e_best  → update e_best, x_best, stale = 0
+           elif REFINE      → stale += 1
+      3. Append e_t to sliding window e_buf
+      4. EXPLORE + buffer full:
+           D_t = e_buf[0] - e_buf[-1];  O_t = Σ|e_buf[i]-e_buf[i-1]|
+           ψ_t = O_t / (|D_t| + eps)
+           trigger if ψ_t ≥ ψ  OR  (D_t ≤ 0 AND e_t > e_best)
+           → switch@step, phase=REFINE, rollback x→x_best, skip update
+      5. REFINE + stale ≥ w:
+           → stop@step, done=True, rollback x→x_best, terminate
+      6. Normal update with eta_1 (EXPLORE) or eta_2 (REFINE)
+
+    Energy recorded BEFORE the update → switch@k / stop@m refer to the step
+    whose energy triggered the decision.  The rollback affects the next state.
+    Final output: x_best (best cached state).
 
     Returns
     -------
@@ -298,16 +315,15 @@ def _run_bars(model_list, labels, x0, n, im_size,
     switch_step   : int | None    step at which EXPLORE→REFINE triggered
     terminate_step: int | None    step at which early termination triggered
     """
-    eps_f    = 1e-8
-    eta_lo   = beta * eta_hi
+    eps_f          = 1e-8
 
-    phase         = 'EXPLORE'
-    x_best        = x0.detach().clone()   # GPU tensor
-    e_best        = float('inf')
-    e_buf         = deque(maxlen=window)  # sliding window of energies
-    stale         = 0
-    done          = False
-    switch_step   = None
+    phase          = 'EXPLORE'
+    x_best         = x0.detach().clone()   # GPU tensor — best cached state
+    e_best         = float('inf')
+    e_buf          = deque(maxlen=window)  # sliding window of last w energies
+    stale          = 0                     # consecutive REFINE steps without improvement
+    done           = False
+    switch_step    = None
     terminate_step = None
 
     im = x0.clone()
@@ -322,7 +338,7 @@ def _run_bars(model_list, labels, x0, n, im_size,
             phases.append('DONE')
             continue
 
-        # ── Step 0: Langevin noise (deterministic per-step seed) ──────────────
+        # ── Langevin noise (deterministic per-step seed) ──────────────────────
         g = torch.Generator(device='cuda')
         g.manual_seed(1000 + step)
         noise = torch.empty(n, 3, im_size, im_size, device='cuda').normal_(generator=g)
@@ -347,8 +363,8 @@ def _run_bars(model_list, labels, x0, n, im_size,
 
         # ── Step 4: EXPLORE — overshoot detection (buffer must be full) ────────
         if phase == 'EXPLORE' and len(e_buf) == window:
-            buf = list(e_buf)                       # oldest → newest
-            D_t   = buf[0] - buf[-1]                # net decrease (+ = good)
+            buf   = list(e_buf)                       # oldest → newest
+            D_t   = buf[0] - buf[-1]                  # net decrease (+ = good)
             O_t   = sum(abs(buf[i] - buf[i-1]) for i in range(1, window))
             psi_t = O_t / (abs(D_t) + eps_f)
 
@@ -357,12 +373,12 @@ def _run_bars(model_list, labels, x0, n, im_size,
             if trigger:
                 phase       = 'REFINE'
                 switch_step = step
-                # Teleport: x_t → x_best
+                # Rollback: x_t → x_best  (delta = x_best − x_t applied)
                 im = x_best.clone()
                 energies.append(e_t)
                 phases.append('SWITCH')
                 trajectory.append(im.cpu())
-                continue
+                continue          # next step uses eta_2
 
         # ── Step 5: REFINE — early termination ────────────────────────────────
         if phase == 'REFINE' and stale >= window:
@@ -372,10 +388,10 @@ def _run_bars(model_list, labels, x0, n, im_size,
             energies.append(e_t)
             phases.append('DONE')
             trajectory.append(im.cpu())
-            continue
+            continue              # remaining steps pad with x_best / e_best
 
         # ── Step 6: Normal gradient step ──────────────────────────────────────
-        eta = eta_lo if phase == 'REFINE' else eta_hi
+        eta = eta_2 if phase == 'REFINE' else eta_1
         im  = (im - eta * im_grad).clamp(0, 1).detach()
         energies.append(e_t)
         phases.append(phase)
@@ -462,22 +478,24 @@ def bars_figure(model_list, select_idx):
     plot_steps = [0] + eval_steps
 
     # ── Configurations ─────────────────────────────────────────────────────────
-    # BARS: (display_name, η_hi multiplier, β, window w, ψ_th)
-    # β = η_lo / η_hi = 1x / 2x = 0.5  →  refine step = 1× base, explore step = 2× base
-    # Sweep window w ∈ {2, 4, 6, 10, 15, 20} to study sensitivity.
-    # One aggressive reference (16x → 1.6x) is kept for context.
+    # BARS: (display_name, eta_1_mult, eta_2_mult, window w, psi)
+    # Each step size is expressed as a multiplier of eta_base.
+    # eta_1 = explore step size, eta_2 = refine step size (independent, not a ratio).
+    #
+    # Default (required by spec): eta_1=4x, eta_2=1x, w=5, psi=2
+    # Additional setups vary one parameter at a time to study sensitivity.
     bars_configs = [
-        ('BARS 2x→1x w=2',   2.0, 0.5,  2, 2.0),
-        ('BARS 2x→1x w=4',   2.0, 0.5,  4, 2.0),
-        ('BARS 2x→1x w=6',   2.0, 0.5,  6, 2.0),
-        ('BARS 2x→1x w=10',  2.0, 0.5, 10, 2.0),
-        ('BARS 2x→1x w=15',  2.0, 0.5, 15, 2.0),
-        ('BARS 2x→1x w=20',  2.0, 0.5, 20, 2.0),
-        ('BARS 16x β=0.1 w=10', 16.0, 0.1, 10, 2.0),
+        # name                          eta_1_m  eta_2_m  w   psi
+        ('BARS 4x→1x w=5 ψ=2',          4.0,     1.0,    5,  2.0),  # default
+        ('BARS 8x→1x w=5 ψ=2',          8.0,     1.0,    5,  2.0),  # aggressive explore
+        ('BARS 16x→1x w=5 ψ=2',        16.0,     1.0,    5,  2.0),  # very aggressive explore
+        ('BARS 4x→2x w=5 ψ=2',          4.0,     2.0,    5,  2.0),  # larger refine step
+        ('BARS 4x→1x w=10 ψ=2',         4.0,     1.0,   10,  2.0),  # wider window
+        ('BARS 4x→1x w=5 ψ=3',          4.0,     1.0,    5,  3.0),  # harder to trigger switch
     ]
 
-    # Fixed baselines: 1x (default), 2x, 4x
-    fixed_mults = [1.0, 2.0, 4.0]
+    # Fixed baselines: 1x, 2x, 4x, 8x, 16x (as required by spec)
+    fixed_mults = [1.0, 2.0, 4.0, 8.0, 16.0]
 
     results = {}   # name → metrics dict
 
@@ -504,7 +522,7 @@ def bars_figure(model_list, select_idx):
     for mult in fixed_mults:
         name = f'Fixed {int(mult)}x'
         step_size = eta_base * mult
-        print(f"  {name} (η = {step_size:.1f}) ...", end=' ', flush=True)
+        print(f"  {name} (η = {step_size:.2f}) ...", end=' ', flush=True)
         _offload_inception()
 
         m_copy = [copy.deepcopy(m) for m in model_list]
@@ -535,15 +553,17 @@ def bars_figure(model_list, select_idx):
 
     # ── Run BARS configs ───────────────────────────────────────────────────────
     print("=== BARS configurations ===")
-    for (name, mult, beta, window, psi_th) in bars_configs:
-        eta_hi = eta_base * mult
-        print(f"  {name} (η_hi={eta_hi:.1f}, β={beta}, w={window}) ...", end=' ', flush=True)
+    for (name, m1, m2, window, psi_th) in bars_configs:
+        eta_1 = eta_base * m1
+        eta_2 = eta_base * m2
+        print(f"  {name} (η_1={eta_1:.2f}, η_2={eta_2:.2f}, w={window}, ψ={psi_th}) ...",
+              end=' ', flush=True)
         _offload_inception()
 
         m_copy = [copy.deepcopy(m) for m in model_list]
         traj, energies, phases, sw_step, term_step = _run_bars(
             m_copy, labels, x0, n, im_size,
-            eta_hi=eta_hi, beta=beta, window=window, psi_th=psi_th,
+            eta_1=eta_1, eta_2=eta_2, window=window, psi_th=psi_th,
         )
         del m_copy
         torch.cuda.empty_cache()
@@ -554,9 +574,9 @@ def bars_figure(model_list, select_idx):
         fid_vals  = [x0_fid]  + fid_vals
         prec_vals = [x0_prec] + prec_vals
 
-        sw_tag   = f"switch@{sw_step}"   if sw_step   is not None else "no switch"
-        term_tag = f"term@{term_step}"   if term_step is not None else "no term"
-        print(f"{sw_tag}, {term_tag} | IS={is_vals[-1]:.3f}  FID={fid_vals[-1]:.1f}  Prec={prec_vals[-1]:.3f}")
+        sw_tag   = f"switch@{sw_step}" if sw_step   is not None else "no switch"
+        stop_tag = f"stop@{term_step}" if term_step is not None else "no early stop"
+        print(f"{sw_tag}, {stop_tag} | IS={is_vals[-1]:.3f}  FID={fid_vals[-1]:.1f}  Prec={prec_vals[-1]:.3f}")
 
         results[name] = {
             'energies':        energies,
@@ -568,9 +588,10 @@ def bars_figure(model_list, select_idx):
             'final_fid':       fid_vals[-1],
             'final_precision': prec_vals[-1],
             'type':            'bars',
-            'mult':            mult,
-            'beta':            beta,
+            'eta_1_mult':      m1,
+            'eta_2_mult':      m2,
             'window':          window,
+            'psi':             psi_th,
             'switch_step':     sw_step,
             'terminate_step':  term_step,
         }
@@ -584,23 +605,18 @@ def bars_figure(model_list, select_idx):
     steps = list(range(FLAGS.num_steps))
 
     # Color palettes
-    fixed_palette = {
-        'Fixed 1x': '#1f77b4',   # steel blue  (dashed baseline)
-        'Fixed 2x': '#2ca02c',   # green
-        'Fixed 4x': '#d62728',   # red
-    }
-    # w-sweep: sequential purple→orange colormap for the 6 BARS 2x→1x configs
     import matplotlib.cm as _cm
-    _w_colors = [_cm.plasma(v) for v in np.linspace(0.15, 0.85, 6)]
-    bars_palette = {
-        'BARS 2x→1x w=2':        _w_colors[0],
-        'BARS 2x→1x w=4':        _w_colors[1],
-        'BARS 2x→1x w=6':        _w_colors[2],
-        'BARS 2x→1x w=10':       _w_colors[3],
-        'BARS 2x→1x w=15':       _w_colors[4],
-        'BARS 2x→1x w=20':       _w_colors[5],
-        'BARS 16x β=0.1 w=10':  '#555555',   # dark grey — reference
-    }
+    # Fixed baselines: perceptually uniform blue→red gradient (5 multipliers)
+    _fix_colors = [_cm.cool(v) for v in np.linspace(0.05, 0.95, len(fixed_mults))]
+    fixed_palette = {f'Fixed {int(m)}x': _fix_colors[i]
+                     for i, m in enumerate(fixed_mults)}
+    fixed_palette['Fixed 1x'] = '#1f77b4'   # override: canonical steel-blue baseline
+
+    # BARS: warm plasma colormap for all 6 configs
+    _b_colors = [_cm.plasma(v) for v in np.linspace(0.10, 0.90, len(bars_configs))]
+    bars_palette = {c[0]: _b_colors[i] for i, c in enumerate(bars_configs)}
+    # Mark the default config distinctly
+    bars_palette['BARS 4x→1x w=5 ψ=2'] = '#e31a1c'  # bright red = default
 
     bars_names  = [c[0] for c in bars_configs]
     fixed_names = [f'Fixed {int(m)}x' for m in fixed_mults]
@@ -609,7 +625,7 @@ def bars_figure(model_list, select_idx):
     # ── Figure 1: Energy proxy vs sampling step ────────────────────────────────
     fig, ax = plt.subplots(figsize=(13, 6))
 
-    # Fixed baselines
+    # Fixed baselines (1x dashed as canonical reference, others solid)
     for name in fixed_names:
         r    = results[name]
         mult = r['mult']
@@ -617,37 +633,46 @@ def bars_figure(model_list, select_idx):
         ls   = '--' if mult == 1.0 else '-'
         lw   = 2.5  if mult == 1.0 else 1.5
         ax.plot(steps, r['energies'], color=col, linestyle=ls, linewidth=lw,
-                alpha=0.75, label=name)
+                alpha=0.80, label=name)
 
-    # BARS configs
+    # BARS configs — bold the default, annotate switch@ and stop@
+    _is_default = 'BARS 4x→1x w=5 ψ=2'
     for name in bars_names:
         r      = results[name]
         col    = bars_palette[name]
         en     = r['energies']
         sw     = r['switch_step']
         term   = r['terminate_step']
+        lw     = 3.0 if name == _is_default else 1.8
+        zord   = 4   if name == _is_default else 3
 
-        ax.plot(steps, en, color=col, linewidth=2.2, label=name)
+        ax.plot(steps, en, color=col, linewidth=lw, zorder=zord,
+                label=name + (' [default]' if name == _is_default else ''))
 
-        # Vertical dashed line at phase switch
+        # Vertical dashed line + annotation at phase switch
         if sw is not None and sw < FLAGS.num_steps:
-            ax.axvline(sw, color=col, linestyle=':', linewidth=1.0, alpha=0.7)
-            y_ann = max(en[sw] * 1.01, en[sw] + 0.02 * (max(en) - min(en)))
+            ax.axvline(sw, color=col, linestyle=':', linewidth=1.0, alpha=0.7, zorder=2)
+            y_range = max(en) - min(en)
+            y_ann   = en[sw] + 0.04 * y_range
             ax.annotate(
                 f'switch@{sw}',
-                xy=(sw, en[sw]), xytext=(sw + 0.5, y_ann),
-                fontsize=7, color=col, va='bottom',
+                xy=(sw, en[sw]), xytext=(sw + 0.4, y_ann),
+                fontsize=7, color=col, va='bottom', fontweight='bold',
                 arrowprops=dict(arrowstyle='->', color=col, lw=0.8),
             )
+        else:
+            # Explicitly note no switch in legend label (not on curve, handled in table)
+            pass
 
-        # Shaded region after termination (flat tail)
+        # Shaded region + annotation at early stop
         if term is not None and term < FLAGS.num_steps:
-            ax.axvspan(term, FLAGS.num_steps - 1, alpha=0.07, color=col)
+            ax.axvspan(term, FLAGS.num_steps - 1, alpha=0.07, color=col, zorder=1)
             ax.annotate(
-                f'term@{term}',
-                xy=(term, en[term]), xytext=(term + 0.5, en[term] * 0.98),
-                fontsize=7, color=col, va='top',
+                f'stop@{term}',
+                xy=(term, en[term]), xytext=(term + 0.4, en[term] * 0.97),
+                fontsize=7, color=col, va='top', fontweight='bold',
             )
+        # If no early stop: nothing extra drawn (reported in summary table)
 
     ax.set_xlabel('Sampling step', fontsize=12)
     ax.set_ylabel('Energy proxy  (mean ‖∇E‖₂)', fontsize=12)
@@ -680,12 +705,14 @@ def bars_figure(model_list, select_idx):
             ls   = '--' if mult == 1.0 else '-'
             lw   = 2.5  if mult == 1.0 else 1.5
             ax.plot(plot_steps, r[key], color=col, linestyle=ls, linewidth=lw,
-                    alpha=0.8, label=name, marker='o', markersize=3)
+                    alpha=0.85, label=name, marker='o', markersize=3)
         for name in bars_names:
-            r   = results[name]
-            col = bars_palette[name]
-            ax.plot(plot_steps, r[key], color=col, linewidth=2.0,
-                    label=name, marker='s', markersize=4)
+            r    = results[name]
+            col  = bars_palette[name]
+            lw   = 3.0 if name == _is_default else 1.8
+            lbl  = name + (' [default]' if name == _is_default else '')
+            ax.plot(plot_steps, r[key], color=col, linewidth=lw,
+                    label=lbl, marker='s', markersize=4)
         ax.set_xlabel('Sampling step', fontsize=11)
         ax.set_ylabel(ylabel, fontsize=11)
         ax.set_title(f'{ylabel} over sampling steps', fontsize=11)
@@ -741,17 +768,18 @@ def bars_figure(model_list, select_idx):
 
     # ── Summary table ──────────────────────────────────────────────────────────
     col_w = max(len(n) for n in all_names) + 2
-    print(f"\n{'─'*(col_w+55)}")
+    print(f"\n{'─'*(col_w+65)}")
     print(f"{'Config':<{col_w}} | {'Final IS':>8} | {'Final FID':>9} | {'Final Prec':>10} | Notes")
-    print(f"{'─'*(col_w+55)}")
+    print(f"{'─'*(col_w+65)}")
     for name in all_names:
         r    = results[name]
         note = ''
         if r['type'] == 'bars':
             sw   = r.get('switch_step')
             term = r.get('terminate_step')
-            note = (f"switch@{sw}" if sw   is not None else "no switch") + \
-                   (f", term@{term}" if term is not None else "")
+            sw_note   = f"switch@{sw}"  if sw   is not None else "never switches"
+            stop_note = f", stop@{term}" if term is not None else ", no early stop"
+            note = sw_note + stop_note
         print(f"{name:<{col_w}} | {r['final_is']:>8.4f} | {r['final_fid']:>9.2f}"
               f" | {r['final_precision']:>10.4f} | {note}")
 
